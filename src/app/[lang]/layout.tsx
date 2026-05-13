@@ -1,14 +1,10 @@
-import { RootProvider } from 'fumadocs-ui/provider/next';
-import '@/app/global.css';
-import { Inter } from 'next/font/google';
-import { i18n } from '@/lib/i18n';
-import { i18nUI } from '@/lib/layout.shared';
-import { getDictionary } from '@/dictionaries';
-import { DictionaryProvider } from '@/components/dictionary-provider';
+import { RootProvider } from "fumadocs-ui/provider/next";
+import "@/app/global.css";
 
-const inter = Inter({
-  subsets: ['latin'],
-});
+import { i18n } from "@/lib/i18n";
+import { i18nUI } from "@/lib/layout.shared";
+import { getDictionary } from "@/dictionaries";
+import { DictionaryProvider } from "@/components/dictionary-provider";
 
 export function generateStaticParams() {
   return i18n.languages.map((lang) => ({ lang }));
@@ -17,12 +13,12 @@ export function generateStaticParams() {
 export default async function Layout({
   params,
   children,
-}: LayoutProps<'/[lang]'>) {
+}: LayoutProps<"/[lang]">) {
   const { lang } = await params;
   const dictionary = await getDictionary(lang);
 
   return (
-    <html lang={lang} className={inter.className} suppressHydrationWarning>
+    <html lang={lang} suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
         <RootProvider i18n={i18nUI.provider(lang)}>
           <DictionaryProvider value={dictionary}>{children}</DictionaryProvider>
