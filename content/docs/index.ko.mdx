@@ -1,18 +1,20 @@
 ---
-title: 환영해요
-description: AWS 람다 백엔드를 위한 Python 프레임워크, sawsi 공식 핸드북이에요.
+title: 환영합니다
+description: AWS 람다 백엔드를 위한 Python 프레임워크, sawsi 공식 핸드북에 오신 걸 환영해요.
 ---
 
-**sawsi** (simple-aws-interface)는 따분한 부분을 다시 발명하지 않고 AWS 람다 백엔드를 출시하기 위한 Python 프레임워크예요. `cmd` 기반 라우터, Pydantic 기반 DynamoDB ORM, 지연 로딩 AWS 서비스 래퍼, 그리고 의견 있는 배포 흐름을 하나의 일관된 스택으로 묶었어요.
+**sawsi** (simple-aws-interface)는 따분한 부분을 반복 작업 없이 AWS 람다 기반 백엔드를 개발하기 위한 Python 프레임워크에요. `cmd` 기반 라우터, Pydantic 기반 DynamoDB ORM, 지연 로딩 AWS 서비스 래퍼, 그리고 opinionated한 배포 흐름을 하나의 일관된 스택으로 묶었어요.
 
 이 핸드북은 첫 원칙부터 배포 당일 체크리스트까지 프레임워크를 다뤄요. 네 개의 큰 흐름으로 나뉘어 있어요:
 
 <Cards>
   <Card title="기초" href="/docs/introduction/about">
-    sawsi가 무엇인지, 왜 존재하는지, 그리고 이후 모든 페이지에서 들고 다닐 멘탈 모델을 알려드려요.
+    sawsi가 무엇인지, 왜 존재하는지, 그리고 이후 모든 페이지에서 들고 다닐 멘탈
+    모델을 알려드려요.
   </Card>
   <Card title="빌딩 블록" href="/docs/handlers/request-lifecycle">
-    핸들러, 라우팅, DynamoModel, 인증, 그리고 `api.py` 뒤에 있는 AWS 서비스 래퍼들을 다뤄요.
+    핸들러, 라우팅, DynamoModel, 인증, 그리고 `api.py` 뒤에 있는 AWS 서비스
+    래퍼들을 다뤄요.
   </Card>
   <Card title="아키텍처" href="/docs/architecture/multi-lambda">
     다중 람다 구성, 에러 모델, 옵저버빌리티, 그리고 배포 파이프라인을 살펴봐요.

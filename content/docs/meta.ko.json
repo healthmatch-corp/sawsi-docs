@@ -1,0 +1,20 @@
+{
+  "title": "문서",
+  "pages": [
+    "index",
+    "---기초---",
+    "introduction",
+    "cli",
+    "---구성 요소---",
+    "handlers",
+    "data",
+    "auth",
+    "services",
+    "---아키텍처---",
+    "architecture",
+    "deployment",
+    "---실무---",
+    "practice",
+    "reference"
+  ]
+}
