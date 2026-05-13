@@ -234,6 +234,11 @@ html > body[data-scroll-locked] {
   --removed-body-scroll-bar-size: 0px !important;
 }
 
+/* sidebar 메뉴상의 섹션 타이틀 텍스트 스타일링 */
+#nd-sidebar p {
+  @apply font-semibold text-fd-accent-foreground;
+}
+
 @font-face {
   font-family: "Pretendard";
   src: url("https://cdn.jsdelivr.net/gh/projectnoonnu/pretendard@1.0/Pretendard-Thin.woff2")
