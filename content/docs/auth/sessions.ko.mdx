@@ -1,0 +1,190 @@
+---
+title: 세션
+description: 사용자 세션, 보안 토큰, OTP 스타일 재전송 방지, 그리고 세션 없음 화이트리스트를 다뤄요.
+---
+
+sawsi는 인증 제공자에 대한 의견은 없지만, **세션 수명, 재전송 방지, 그리고 요청이 어떻게 `user` 객체에 도달하는지**에 대한 컨벤션은 있어요. 이 페이지에서 그 내용을 다뤄요.
+
+## 세션 모델
+
+```python title="main/model/user_session.py"
+from secrets import token_urlsafe
+from sawsi.model.base import DynamoModel, sync
+from pydantic import BaseModel
+import api
+
+class DeviceInfo(BaseModel):
+    build_number: str | None = None
+    version: str | None = None
+    platform_os: str | None = None
+    platform_version: str | None = None
+    language: str | None = 'ko'
+
+@sync
+class UserSession(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user_session'
+    _indexes = [('user_id', 'crt')]
+
+    user_id: str
+    source_ip: str
+    device_info: DeviceInfo = DeviceInfo()
+
+    use_secure: bool = False
+    otp_secret: str = token_urlsafe(32)
+    ts_offset: int = 0
+```
+
+세션은 세 개의 보안 노브를 가져요.
+
+- `otp_secret` — 32바이트 URL-safe 랜덤 토큰이에요. 세션 생성 시 서버에서 1회 생성하고, 생성 이후에는 클라이언트에 평문으로 다시 보내지 않아요.
+- `ts_offset` — 클라이언트 시계와 서버 시계의 차이예요. 세션 생성 시 캡처해서, OTP 윈도우가 시계가 어긋난 클라이언트도 받아들이게 해줘요.
+- `use_secure` — OTP 재전송 검사 기능 플래그예요 (마이그레이션 중 레거시 세션은 false, 새 세션은 모두 true예요).
+
+## 요청 인증
+
+핸들러가 세션 테이블을 만지는 유일한 곳이에요. `User`를 얻으면 `body['user']`에 넣고, 시그니처에 `user`를 명명한 모든 컨트롤러는 Layer 4 주입으로 받아요.
+
+```python title="main/aws_handler.py"
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+
+    sid = headers.get('session_id')
+    o_c = body.get('o_c')                  # 클라이언트가 계산한 OTP 코드
+    req_ts = int(event['requestContext']['requestTimeEpoch']) / 1000
+
+    body['user'] = None
+    if sid:
+        body['user'] = auth_service.get_me(session_id=sid, o_c=o_c, req_ts=req_ts)
+
+    return router(body.pop('cmd'), body, headers, allowed_cmd_prefixes=['main.controller'])
+```
+
+`auth_service.get_me()`는 프로젝트의 리졸버예요. 전형적인 모양은 이래요.
+
+```python
+def get_me(session_id, o_c, req_ts):
+    session = UserSession.get(session_id)
+    if not session:
+        raise errs.invalid_session
+
+    if session.use_secure:
+        _verify_otp(session, o_c, req_ts)    # 윈도우 미스면 raise
+
+    user = User.get(session.user_id)
+    if not user:
+        raise errs.no_such_user
+    return user
+```
+
+## OTP 스타일 재전송 방지
+
+`otp_secret`과 `ts_offset`이 함께 단순한 롤링 윈도우 재전송 검사를 구현해요.
+
+- 로그인 시 서버가 `o_s = otp_secret`을 클라이언트에 **1회** 보내고, `ts_offset = server_ts - client_ts`를 기록해요.
+- 이후 모든 요청에서 클라이언트가 `o_c = md5(f'{current_client_ts}|{otp_secret}')`을 계산해 body에 포함시켜요.
+- 서버는 `client_ts ≈ server_ts - ts_offset`을 취하고, 가장 가까운 15초 윈도우로 반올림한 뒤, 시계 어긋남을 흡수하기 위해 세 연속 윈도우(이전, 현재, 다음)와 해시를 비교해요.
+
+```python
+def _verify_otp(session, o_c, req_ts):
+    client_ts = req_ts - session.ts_offset
+    window = int(client_ts // 15)
+    for w in (window - 1, window, window + 1):
+        expected = md5(f'{w * 15}|{session.otp_secret}'.encode()).hexdigest()
+        if expected == o_c:
+            return
+    raise errs.invalid_otp
+```
+
+`session_id`만 유출되면 `otp_secret` 없이는 쓸모없고, 캡처된 `o_c`는 45초 후에 쓸모없어져요.
+
+## 세션 생성
+
+```python
+def _create_user_session_secure(user_id, source_ip, device_info, c_ts, req_ts):
+    session = UserSession(
+        user_id=user_id,
+        source_ip=source_ip,
+        device_info=device_info or DeviceInfo(),
+        use_secure=True,
+        ts_offset=int(req_ts - c_ts) if c_ts else 0,
+    )
+    session.put()
+    return session.id, session
+```
+
+반환값은 `(session_id, UserSession)`이에요.
+
+- `session_id`는 이후 모든 요청의 `session_id` 헤더가 돼요.
+- `UserSession.otp_secret`은 로그인 응답의 `o_s` 필드가 돼요 (클라이언트가 보는 유일한 순간이에요).
+
+<Callout type="warn">
+레거시 헬퍼 `_create_user_session`(접미사 `_secure` 없음)은 평문 session id 대신 해시된 토큰을 반환해요. 새 코드에는 쓰지 마세요 — secure 경로 기준 클라이언트가 인증에 실패해요.
+</Callout>
+
+## 비밀번호 & SMS 코드 흐름
+
+전형적인 전화 기반 인증 경로예요.
+
+1. `send_sms_auth_code(phone)` — 6자리 코드를 생성하고, phone 키로 `SmsAuthCode`에 해시 저장한 뒤 `api.sms.send_sms(...)`로 발송해요.
+2. `get_sms_auth_token(phone, code)` — 코드 검증 후 단기 불투명 토큰을 반환해요.
+3. `register(phone, password, auth_token, name, birth, ...)` 또는 `login(phone, password, auth_token)` — 토큰 검증(단일 사용) 후 `UserSession`을 생성해요.
+
+비밀번호 저장은 `hash_util.hash_password(salt + '|' + password)`를 쓰고, 사용자별 솔트는 `hash_util.make_salt()`를 사용해요.
+
+## 재시도 방어
+
+비밀번호 로그인에선 `PasswordRetry` 모델(또는 Locking 키, DynamoDB 카운터)에 작은 카운터를 두고, 윈도우 안에서 N번 실패하면 거부해요. 패턴은 이래요.
+
+```python
+def login(phone, password, ...):
+    retry = password_retry_service.get_retry_count(phone)
+    if retry >= 5:
+        return {'status': 'failed_by_retry'}
+    ...
+    if not _password_matches(user, password):
+        password_retry_service.increment(phone)
+        return {'status': 'failed'}
+    password_retry_service.reset(phone)
+```
+
+## 세션 없음 화이트리스트
+
+일부 컨트롤러는 인증 없이 도달해야 해요 — register, login, 비밀번호 재설정, 공개 read 엔드포인트가 여기에 해당해요. 핸들러에 명시적 화이트리스트를 두세요.
+
+```python
+NO_SESSION_CMDS = {
+    'main.controller.system.health_check',
+    'main.controller.member.register',
+    'main.controller.member.login',
+    'main.controller.member.send_sms_auth_code',
+    'main.controller.member.get_sms_auth_token',
+    'main.controller.google_auth.google_login',
+    'main.controller.google_auth.google_register',
+    'main.controller.apple_auth.apple_login',
+    'main.controller.apple_auth.apple_register',
+}
+
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    cmd = body.get('cmd')
+    sid = handler_util.get_headers(event, context).get('session_id')
+
+    if not sid and cmd not in NO_SESSION_CMDS:
+        raise errs.no_session
+    ...
+```
+
+래퍼의 `ignore_app_errors`에 `errs.no_session`을 추가해서, 세션 부재가 오콜을 호출하지 않게 해주세요.
+
+## 다음
+
+<Cards>
+  <Card title="OAuth & 소셜 로그인" href="/docs/auth/oauth">
+    Google/Apple/Kakao 로그인 + 회원가입 2단계 패턴이에요.
+  </Card>
+  <Card title="어드민 서브시스템" href="/docs/auth/admin">
+    AdminManager/AdminGroup, IP 필터, cmd 화이트리스트를 다뤄요.
+  </Card>
+</Cards>

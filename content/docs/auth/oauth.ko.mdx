@@ -1,0 +1,243 @@
+---
+title: OAuth & 소셜 로그인
+description: id_token 검증과 sparse social_id GSI 기반의 2단계 login/register 패턴을 알려드려요.
+---
+
+sawsi는 OAuth/소셜 로그인을 **2단계 패턴**으로 표준화해요 — 로그인 시도를 위한 cmd 하나, 그리고 사용자가 새로 가입하는 경우 회원가입을 마무리하는 별도 cmd가 있어요. 모양은 Google, Apple, Kakao 등에 걸쳐 동일하고 — 검증 계층만 달라요.
+
+## 2단계 계약
+
+| Step | cmd | 입력 | 출력 |
+|---|---|---|---|
+| 1 | `{provider}_login` | `id_token` (+ source ip, device info) | 세션과 함께 `'succeed'`, 또는 추출된 프로필 필드와 함께 `'need_register'` |
+| 2 | `{provider}_register` | `id_token` + 누락된 프로필 필드(`name`, `birth`, …) | 새 세션과 함께 `'succeed'`, 또는 `'already_registered'` |
+
+클라이언트 흐름은 이래요.
+
+1. 플랫폼 OAuth 시트를 열어 `id_token`을 획득해요.
+2. `{provider}_login`을 호출해요. `status === 'succeed'`면 끝이에요.
+3. `status === 'need_register'`면 서버가 반환한 정보로 사전 채워진 가입 폼을 보여주고 → 나머지 정보와 함께 `{provider}_register`를 호출해요.
+
+두 엔드포인트 모두 세션 없음 화이트리스트에 들어가요.
+
+## 왜 AppError가 아니라 status 문자열인가요
+
+새 사용자는 **에러가 아니에요** — 일상적인 결과예요. `AppError`를 raise하면 알림 파이프에 들어가고, 클라이언트가 non-200 응답을 처리하게 만들고, 인증 실패와 첫 가입을 혼동하게 돼요.
+
+그래서 컨트롤러는 `{'status': 'need_register' | 'succeed' | 'already_registered' | 'invalid_token', ...}`을 반환하고, 클라이언트가 `status`로 분기해요.
+
+## 어디를 만질까요
+
+새 provider를 추가할 때는 보통 **다섯 곳**을 편집해요.
+
+1. `service/social_auth/{provider}_auth.py` — id_token 검증.
+2. `controller/{provider}_auth.py` — 두 컨트롤러.
+3. `model/user.py` — 새 `{provider}_social_id` 필드 + 새 GSI + 헬퍼 클래스메서드.
+4. `aws_handler.py` — 새 두 cmd를 세션 없음 화이트리스트에 추가.
+5. AWS Secrets Manager — `{env}/{project}` 안에 provider의 client_id / 서명 키 등록.
+
+## 1. id_token 검증
+
+### Google
+
+Google은 JWT를 발급하지만 가장 쉬운 검증은 `tokeninfo` HTTPS 엔드포인트예요.
+
+```python title="service/social_auth/google_auth.py"
+import requests
+
+GOOGLE_CLIENT_IDS_IOS = '...'
+GOOGLE_CLIENT_IDS_ANDROID = '...'
+GOOGLE_CLIENT_IDS_WEB = '...'
+
+def verify_google_id_token(id_token):
+    r = requests.get(
+        'https://oauth2.googleapis.com/tokeninfo',
+        params={'id_token': id_token},
+        timeout=5,
+    )
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if data.get('aud') not in {GOOGLE_CLIENT_IDS_IOS, GOOGLE_CLIENT_IDS_ANDROID, GOOGLE_CLIENT_IDS_WEB}:
+        return None
+    if data.get('email_verified') != 'true':           # 주의: 문자열이고 bool이 아니에요
+        return None
+    return type('GoogleInfo', (), {
+        'sub': data['sub'],
+        'email': data.get('email'),
+        'name': data.get('name'),
+    })()
+```
+
+두 가지 함정이 있어요.
+
+- `aud` 클레임은 iOS/Android/Web 클라이언트 ID **중 하나**와 일치해야 해요 — 하나만이 아니에요. 모바일 로그인은 웹과 다른 `aud`를 만들어요.
+- `email_verified`는 boolean이 아니라 문자열 `'true'`로 와요. `data['email_verified'] == True`는 **항상 false**예요.
+
+### Apple
+
+Apple은 회전하는 Apple 공개키로 서명된 표준 JWT를 사용해요.
+
+```python title="service/social_auth/apple_auth.py"
+import jwt
+import requests
+
+APPLE_KEYS_CACHE = {}     # 모듈 레벨 캐시예요; 람다 컨테이너 수명 동안 유지돼요
+APPLE_BUNDLE_IDS = ['com.your.app', 'com.your.app.dev']
+
+def _load_apple_keys():
+    if APPLE_KEYS_CACHE:
+        return APPLE_KEYS_CACHE
+    keys = requests.get('https://appleid.apple.com/auth/keys').json()['keys']
+    for k in keys:
+        APPLE_KEYS_CACHE[k['kid']] = jwt.algorithms.RSAAlgorithm.from_jwk(k)
+    return APPLE_KEYS_CACHE
+
+def verify_apple_id_token(id_token):
+    headers = jwt.get_unverified_header(id_token)
+    public_key = _load_apple_keys().get(headers['kid'])
+    if not public_key:
+        return None
+    try:
+        claims = jwt.decode(id_token, public_key, algorithms=['RS256'], audience=APPLE_BUNDLE_IDS)
+    except jwt.PyJWTError:
+        return None
+    return type('AppleInfo', (), {
+        'sub': claims['sub'],
+        'email': claims.get('email'),
+    })()
+```
+
+두 가지 함정이 있어요.
+
+- `aud`는 bundle id이고, dev/prod를 별도 앱으로 출시한다면 **둘 다** 허용해야 해요.
+- Apple은 id_token에 사용자 이름을 **포함하지 않아요**. 클라이언트가 첫 Apple 로그인 시 한 번 이름을 받고, 별도 `user_name` 파라미터로 `apple_register`에 보내야 해요.
+
+## 2. User 모델 — sparse social_id GSI
+
+```python
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [
+        ('phone', None),
+        ('google_social_id', None),
+        ('apple_social_id', None),
+        ('kakao_social_id', None),
+    ]
+
+    name: str
+    birth: str
+    phone: str = ' '
+
+    google_social_id: str = ' '
+    apple_social_id: str = ' '
+    kakao_social_id: str = ' '
+
+    @classmethod
+    def get_user_by_google_id(cls, sub: str):
+        items, _ = cls.query(pk_field='google_social_id', pk_value=sub, limit=1)
+        return items[0] if items else None
+
+    @classmethod
+    def get_user_by_apple_id(cls, sub: str):
+        items, _ = cls.query(pk_field='apple_social_id', pk_value=sub, limit=1)
+        return items[0] if items else None
+```
+
+각 `{provider}_social_id`는 provider의 안정적 `sub` 클레임으로 키잉되는 sparse GSI예요. 기본값 `' '`가 인덱스를 sparse로 만들어줘요 — 그 provider가 없는 사용자는 "소셜 id로 조회" 쿼리에 나타나지 않아요.
+
+<Callout type="warn">
+사용자를 `social_id`로 매칭해 주세요 — 절대 `email`로는 하지 마세요. 사용자는 provider에서 이메일을 바꿀 수 있고, 계정 간 이메일을 공유할 수 있고, Apple의 private relay를 쓸 수도 있어요. `sub`만 안정적이에요.
+</Callout>
+
+## 3. Login 컨트롤러
+
+```python title="main/controller/google_auth.py"
+from sawsi.handler.controller_decorator import controller
+from main.service.social_auth import google_auth as svc
+from main.service.auth_service import _create_user_session_secure
+from main.model.user import User
+
+@controller
+def google_login(id_token: str, source_ip: str, device_info: dict | None = None,
+                 c_ts: float | None = None, req_ts: float = 0, **kwargs):
+    info = svc.verify_google_id_token(id_token)
+    if not info:
+        return {'status': 'invalid_token'}
+
+    user = User.get_user_by_google_id(info.sub)
+    if user:
+        sid, sess = _create_user_session_secure(user.id, source_ip, device_info, c_ts, req_ts)
+        return {
+            'status': 'succeed',
+            'registered': True,
+            'session_id': sid,
+            'o_s': sess.otp_secret,
+            'user_id': user.id,
+        }
+
+    return {
+        'status': 'need_register',
+        'registered': False,
+        'google_social_id': info.sub,
+        'email': info.email,
+        'name': info.name,
+    }
+```
+
+## 4. Register 컨트롤러
+
+```python
+@controller
+def google_register(id_token: str, name: str, birth: str,
+                    source_ip: str, device_info: dict | None = None,
+                    c_ts: float | None = None, req_ts: float = 0, **kwargs):
+    info = svc.verify_google_id_token(id_token)        # 재검증해요!
+    if not info:
+        return {'status': 'invalid_token'}
+
+    if User.get_user_by_google_id(info.sub):
+        return {'status': 'already_registered'}
+
+    user = User(
+        name=name,
+        birth=birth,
+        google_social_id=info.sub,
+        email=info.email,
+    )
+    user.put()
+
+    sid, sess = _create_user_session_secure(user.id, source_ip, device_info, c_ts, req_ts)
+    return {
+        'status': 'succeed',
+        'session_id': sid,
+        'o_s': sess.otp_secret,
+        'user_id': user.id,
+    }
+```
+
+자명하지 않은 두 가지를 짚어드릴게요.
+
+- **`register` 안에서 id_token을 재검증해 주세요.** 그렇지 않으면 오래된 `need_register` 응답을 캡처한 공격자가 다른 이름/생일로 등록을 조작할 수 있어요.
+- **`put()` 직전에 `get_user_by_google_id`로 확인해 주세요.** 동시에 두 register 호출이 모두 검사를 통과할 수 있는 작은 경합 윈도우가 있어요 — 트래픽이 많은 provider라면 `with api.locking.lock(f'register_{info.sub}'): ...`로 감싸세요.
+
+## 5. Provider 추가 체크리스트
+
+```
+[ ] service/social_auth/{provider}_auth.py — verify_*_id_token()
+[ ] AWS Secrets Manager: {env}/{project}에 client_id / 서명 키 (dev + prod)
+[ ] User 모델: 기본값 ' '인 {provider}_social_id 필드
+[ ] User 모델: _indexes += [('{provider}_social_id', None)]
+[ ] User 모델: get_user_by_{provider}_id 클래스메서드
+[ ] controller/{provider}_auth.py: {provider}_login과 {provider}_register
+[ ] aws_handler.py: cmd를 NO_SESSION_CMDS에 추가
+[ ] IAM 정책: dev 및 prod 모두에 Secrets Manager 경로 커버
+[ ] build_keeper.py: User GSI 갱신을 위해 배포
+```
+
+## 다음
+
+- [어드민 서브시스템](/docs/auth/admin) — 사용자 인증과 구조/권한 모두 달라요.
+- [보안 자세](/docs/deployment/security) — 이게 들어가는 더 큰 그림을 다뤄요.

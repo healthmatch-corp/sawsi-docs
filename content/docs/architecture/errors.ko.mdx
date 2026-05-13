@@ -1,0 +1,216 @@
+---
+title: 에러 & 결과 코드
+description: A/B/U 코드 체계, AppError, ignore 리스트, 예외가 응답이 되는 법을 알려드려요.
+---
+
+sawsi 핸들러의 모든 응답은 `rslt_cd` 필드를 담아요. 클라이언트가 이 코드로 분기하고, 오콜 엔지니어가 이걸로 grep해요. 시스템은 작지만 엄격해요 — 거스르면 뒤죽박죽 알림과 혼란스러운 클라이언트를 얻게 돼요.
+
+## 코드 체계
+
+```
+A     성공
+B     비즈니스 에러 (라이브러리 + 애플리케이션)
+U     알 수 없음 — 잡지 못한 예외
+```
+
+| Prefix | 범위 | 의미 |
+|---|---|---|
+| `A00000` | 한 값 | 일반 성공. 래퍼가 자동으로 부여해요. |
+| `B00xxx` | 라이브러리 예약 | sawsi 자체가 raise하는 에러예요 (`B00001`: no such cmd, `B00006`: prefix not allowed 등). |
+| `B1xxxx`, `S0001`+ | 당신의 것 | 애플리케이션 에러. 충돌 없는 prefix를 선택해요. |
+| `U99999` | 한 값 | 알 수 없는 예외. 코드가 `AppError`가 아닌 무언가를 raise할 때 래퍼가 부여해요. |
+
+**경험칙**: prefix `A`, `U`, `B0xxxx`로 애플리케이션 에러를 절대 정의하지 마세요. `B1xxxx`, `B2xxxx`, … 또는 카테고리별 글자(`S` 시스템, `E` 이벤트 등 — 라이브러리 코드와 충돌하지 않는 한)를 사용해요.
+
+## 에러 정의
+
+```python title="errs.py"
+from sawsi.shared.error_util import AppError
+
+err_n = 1
+def auto(category: str):
+    global err_n
+    n = err_n
+    err_n += 1
+    return f'{category}{n:04d}'
+
+# 인증
+no_session = AppError(auto('S'), 'no_session')
+invalid_session = AppError(auto('S'), 'invalid_session')
+permission_denied = AppError(auto('S'), 'permission_denied')
+invalid_otp = AppError(auto('S'), 'invalid_otp')
+
+# 전화 / SMS
+invalid_phone = AppError(auto('S'), 'invalid_phone')
+sms_send_failed = AppError(auto('S'), 'sms_send_failed')
+
+# 이벤트
+already_in_event = AppError(auto('E'), 'already_in_event')
+exceed_max_participant_count = AppError(auto('E'), 'exceed_max_participant_count')
+```
+
+`auto()`가 카테고리별 증가 코드를 생성하므로, 새 에러를 추가해도 기존 것들이 재배열되지 않아요. 한 번 부여된 코드는 이동하면 안 돼요 — 클라이언트가 특정 값에 코딩되어 있을 수 있어요.
+
+## raise
+
+```python
+@controller
+def join_event(user, event_id: str, **kwargs):
+    event = Event.get(event_id)
+    if not event:
+        raise errs.no_such_event
+    if event.participant_count >= event.max_participant_count:
+        raise errs.exceed_max_participant_count
+    ...
+```
+
+핸들러 래퍼가 `AppError`를 잡고, 응답을 만들고, (`ignore_app_errors` 리스트에 따라) 선택적으로 알림을 위해 `error_receiver`를 호출해요.
+
+## 래퍼가 하는 일
+
+요청당 래퍼의 예외 경로예요.
+
+```python
+try:
+    result = handler(event, context)
+except AppError as ex:
+    body = {
+        'rslt_cd': str(ex.code),
+        'rslt_msg': str(ex.message),
+        'duration': time.time() - start,
+    }
+    if ex.code not in [e.code for e in ignore_app_errors]:
+        error_receiver(make_error_description(event))
+    return AWSResponse(body)
+except Exception as ex:
+    body = {
+        'rslt_cd': 'U99999',
+        'rslt_msg': str(ex),
+        'duration': time.time() - start,
+    }
+    if use_traceback:
+        body['traceback'] = traceback.format_exc()
+    error_receiver(traceback.format_exc())
+    return AWSResponse(body)
+```
+
+## `ignore_app_errors` — 조용한 실패
+
+일부 `AppError`는 일상적이고 오콜을 호출하면 안 돼요.
+
+```python
+@aws_handler_wrapper(
+    error_receiver=slack_notify,
+    ignore_app_errors=[
+        errs.no_session,           # 마침 로그인 안 된 사용자
+        errs.invalid_session,      # 만료된 세션
+        errs.invalid_phone,        # 잘못된 입력
+        errs.exceed_max_participant_count,   # 알려진 비즈니스 조건
+    ],
+)
+def handler(event, context):
+    ...
+```
+
+응답은 여전히 올바른 `rslt_cd`로 돌아와요. 오콜 채널만 알림을 안 받아요.
+
+리스트는 유기적으로 자라요 — 에러가 소음이 될 만큼 자주 발생하면 추가해 주세요.
+
+## `use_traceback`
+
+```python
+@aws_handler_wrapper(use_traceback=True)
+```
+
+True이면 알 수 없는 예외의 traceback이 응답 본문에 포함돼요. **dev에서만요.** Traceback은 파일 경로, 라인 번호, 변수 이름을 노출해요 — 유용한 디버깅이지만 끔찍한 보안이에요.
+
+prod에선 래퍼가 여전히 `error_receiver`로 traceback을 **로깅**해요 — 클라이언트가 보는 본문만 정제돼요.
+
+## `error_receiver`
+
+문자열 인자 하나를 받는 callable이에요. 예를 들면 이래요.
+
+```python
+def slack_notify(message):
+    requests.post(SLACK_WEBHOOK, json={'text': message})
+
+def discord_notify(message):
+    ...
+
+def stdout(message):
+    print(message)
+```
+
+래퍼가 다음 경우에 호출해요.
+
+- 잡지 못한 모든 예외.
+- `ignore_app_errors`에 없는 모든 `AppError`.
+
+`error_receiver=None`이면 알림이 안 가요. dev엔 stdout, prod엔 webhook을 사용해요.
+
+## 응답 모양
+
+성공이에요.
+
+```json
+{
+  "rslt_cd": "A00000",
+  "rslt_msg": "요청 성공",
+  "duration": 0.042,
+  "your_data": { ... }
+}
+```
+
+비즈니스 에러예요.
+
+```json
+{
+  "rslt_cd": "S0007",
+  "rslt_msg": "already_in_event",
+  "duration": 0.018
+}
+```
+
+알 수 없음이에요.
+
+```json
+{
+  "rslt_cd": "U99999",
+  "rslt_msg": "AttributeError: 'NoneType' object has no attribute 'foo'",
+  "duration": 0.062
+}
+```
+
+(`use_traceback=True`이면 알 수 없음 응답에 `traceback` 필드도 있어요.)
+
+## 로컬라이즈된 에러 메시지
+
+`rslt_msg`는 안정적인 영어식 식별자예요 (`'already_in_event'`). 클라이언트가 자체 i18n 레이어를 거치게 해 주세요.
+
+```typescript
+// 클라이언트
+const message = i18n[response.rslt_msg] ?? defaultErrorMessage;
+```
+
+**서버에서** 로컬라이즈해야 한다면, 반환 전에 `tr(rslt_msg, group='errors').<lang>`를 실행해요. 하지만 rslt_msg는 안정적이어야 해요 — 클라이언트가 한국어를 파싱하면 안 돼요.
+
+## 안티 패턴
+
+- **컨트롤러에서 raw `Exception` raise** — 클라이언트에 `U99999`를 주고 오콜을 호출해요. 항상 `AppError`를 사용하세요.
+- **`A0xxxx`나 `B0xxxx`로 코드 정의** — sawsi 라이브러리 코드와 충돌해요. `B1xxxx`+ 또는 비-`B` prefix를 사용해요.
+- **raise 대신 컨트롤러에서 `{'rslt_cd': 'B12345'}` 반환** — 작동하지만 래퍼가 이를 성공으로 취급해요 (`error_receiver` 호출 없음) — 진짜 비즈니스 에러가 알림에 안 나타나요. `raise AppError(...)`를 써 주세요.
+- **컨트롤러 안에서 `AppError` catch** — 거의 항상 틀려요. 버블링 시키세요.
+
+## 검증은요?
+
+Pydantic이 구문 검증(타입, 필수 필드)을 컨트롤러가 타입 있는 함수라는 이유로 자동 수행해요. 의미 검증(유일성, 범위, 비즈니스 규칙)은 컨트롤러나 서비스에서 처리해요.
+
+```python
+@controller
+def update_email(user, email: str, **kwargs):
+    if not re.match(EMAIL_REGEX, email):
+        raise errs.invalid_email
+    ...
+```
+
+Pydantic 검증 에러는 기본적으로 `U99999`(알 수 없음)로 표면화돼요 — 깔끔한 `AppError`로 변환하려면 함수 본문을 try/except로 감싸거나 Pydantic-aware 에러를 코드베이스에 정의해 주세요.

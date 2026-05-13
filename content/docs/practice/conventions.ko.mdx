@@ -1,0 +1,219 @@
+---
+title: 컨벤션 & 안티패턴
+description: 강제 규칙 — 파일 네이밍, cmd 네이밍, GSI 키, 응답 코드 — 그리고 실패하는 패턴을 정리해 드려요.
+---
+
+이 페이지가 통합된 스타일 가이드예요. 이 컨벤션 대부분이 프레임워크나 agent-skills 린터가 의존하기 때문에 존재해요. 하나를 깨면 "dev에선 작동, prod에선 폭발"과 "깔끔히 출시"의 차이가 돼요.
+
+## 파일과 디렉터리 네이밍
+
+| 항목 | 컨벤션 |
+|---|---|
+| 람다 앱 폴더 | repo 루트의 `<app>/` — `main/`, `admin/`, `queue_receiver/`, `scheduler/` 등. 소문자, snake_case, 복수형 X. |
+| 핸들러 진입점 | `<app>/aws_handler.py`. 항상 이 이름. |
+| 컨트롤러 | `<app>/controller/<module>.py`. 논리 그룹당 파일 하나 (`auth.py`, `event.py`, `member.py`). |
+| 서비스 | `<app>/service/<module>_service.py`. 접미사 옵션이지만 흔해요. |
+| 모델 | `<app>/model/<table_name>.py`. snake_case, `_table` 속성과 일치. |
+| DAO | `<app>/dao/<aggregation>_dao.py`. 쿼리 로직이 단일 모델 클래스에 안 맞을 때. |
+| 마이그레이션 | `<app>/migration/<YYYYMMDD>_<description>.py`. |
+
+## cmd 네이밍
+
+```
+<app>.controller.<module>.<function_name>
+```
+
+예시예요.
+
+```
+main.controller.member.register
+main.controller.event.create_event
+admin.controller.user.search_by_phone
+queue_receiver.controller.match_queue.start_finding
+```
+
+세 가지 규칙이 있어요.
+
+1. **항상 네 개의 점 분리 세그먼트.** 라우터가 prefix 검사를 통과해야 하고, 린터가 이 깊이를 기대해요.
+2. **전체에 snake_case.** `createEvent`와 `CreateEvent`는 잘못이에요.
+3. **함수 이름은 동사.** `get_*`, `list_*`, `create_*`, `update_*`, `delete_*`, 그리고 도메인별 동사예요.
+
+## 응답 모양과 코드
+
+```json
+{
+  "rslt_cd": "A00000",
+  "rslt_msg": "요청 성공",
+  "duration": 0.042,
+  ...
+}
+```
+
+첫 세 키가 프레임워크가 주입해요. 당신 데이터는 그 뒤에 와요.
+
+코드는 이렇게 구성돼요.
+
+- `A` — 성공. 한 값(`A00000`)만 있어요. 자체 `A` 코드를 정의하지 마세요.
+- `B0xxxx` — 라이브러리 예약. 여기 정의하지 마세요.
+- `B1xxxx` 이상 (`B1`, `B2`, ...) — 당신 애플리케이션 에러. 안정적 체계를 선택하세요.
+- `S0001`+ — 대체 시스템 에러 컨벤션 (일부 프로젝트가 카테고리별 `S`, `E` 등 사용해요).
+- `U99999` — 알 수 없음. 래퍼가 부여해요. 컨트롤러에서 `U` 반환 금지예요.
+
+[에러 & 결과 코드](/docs/architecture/errors)를 참고하세요.
+
+## DynamoModel 강제 규칙
+
+```python
+@sync                                            # 필수
+class Event(DynamoModel):
+    __dynamo__ = api.dynamo                       # 필수, 항상 api.dynamo
+    _table = 'event'                              # snake_case
+    _indexes = [                                  # (pk, sk) 튜플 리스트
+        ('creator_id', 'crt'),
+        ('region1', 'crt'),
+        ('invite_code', None),                    # sparse — 아래 필드 기본값 참고
+    ]
+
+    creator_id: str                               # 비즈니스 필드
+    title: str
+    invite_code: str = ' '                        # sparse GSI: ' ', None이나 ''가 아님
+
+    # 이것들을 재정의하지 마세요 — 자동으로 존재해요
+    # id: str
+    # crt: float
+    # u_b: str
+```
+
+린터(`sawsi_lint.py`)가 `@sync` 누락과 다른 몇 가지 위반을 잡아 줘요. 잡지 않지만 중요한 것들도 있어요.
+
+- GSI 키의 `Optional[str] = None`.
+- 재정의된 `id`/`crt`/`u_b`.
+- 파일 이름과 일치하지 않는 `_table` 이름.
+
+## 컨트롤러 강제 규칙
+
+```python
+@controller                                                   # 필수
+def update_profile(user, name: str, birth: str | None = None, # 명시적 파라미터
+                   **kwargs):                                  # 항상 추가 인자 수용
+    if user is None:
+        raise errs.no_session                                 # AppError raise, 에러 dict 반환 X
+    user.name = name
+    if birth:
+        user.birth = birth
+    user.update()
+    return {'name': user.name}                                # 평범한 JSON 직렬화 dict
+```
+
+이렇게 하지 마세요.
+
+- `body`를 단일 dict로 받고 함수 안에서 언패킹. 시그니처 파라미터를 사용하세요.
+- `**kwargs` 잊기. 핸들러가 컨트롤러가 열거할 필요 없는 추가 키(`source_ip`, `req_ts` 등)를 주입해요.
+- `{'statusCode': ..., 'headers': ..., 'body': ...}` 반환 — 래퍼가 감싸 줘요.
+- 컨트롤러 안에서 `AppError` 잡기. 버블링 시키세요.
+
+## 핸들러 강제 규칙
+
+```python
+@handler_util.aws_handler_wrapper(
+    error_receiver=slack_notify,           # prod엔 설정해 두세요
+    use_traceback=False,                    # prod False, dev True
+    ignore_app_errors=[errs.no_session],   # 호출하지 말아야 할 일상 에러
+)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    body['user'] = None
+    body['source_ip'] = handler_util.get_source_ip(event, context)
+    body['req_ts'] = int(event['requestContext']['requestTimeEpoch']) / 1000
+
+    if (sid := handler_util.get_headers(event, context).get('session_id')):
+        body['user'] = auth_service.get_me(...)
+
+    return router(
+        body.pop('cmd'),
+        body,
+        handler_util.get_headers(event, context),
+        allowed_cmd_prefixes=['main.controller'],   # 항상 설정, 비우거나 '*' 금지
+    )
+```
+
+## AWS 클라이언트 접근
+
+```python
+# 올바른 방법
+import api
+api.dynamo.put_item(...)
+api.s3_public.upload_file(...)
+
+# 잘못된 방법
+import boto3
+boto3.client('dynamodb').put_item(...)            # 린터가 잡아요
+
+# 잘못된 방법
+from sawsi.aws.s3.api import S3API
+S3API('dev-myproject-public').upload_file(...)    # 호출마다 새 클라이언트 생성
+```
+
+항상 `api.py`를 경유하세요. 린터(`sawsi_lint.py`)가 `import boto3`와 직접 `*API(...)` 인스턴스화 모두 잡아 줘요.
+
+## 리소스 네이밍
+
+```python
+# api.py
+dynamo = LazyLoadedAPI(DynamoDBAPI, f'{env}-{project_name}', region=region)
+# NOT  LazyLoadedAPI(DynamoDBAPI, 'dev-myproject', region=region)
+```
+
+리소스 이름은 `config.env`와 단일 `project_name` 상수로 빌드하세요. 린터가 하드코딩된 `'dev-...'` 리소스 문자열을 잡아 줘요.
+
+## 린터가 잡는 것
+
+agent-skills harness가 Stop에서 실행되는 작은 린터를 출시해요.
+
+```
+[ ] 직접 `import boto3` 또는 `from boto3 import ...`
+[ ] '<env>-...' 문자열 매칭의 하드코딩 리소스 이름
+[ ] @sync 없는 DynamoModel 서브클래스
+[ ] 리터럴 `statusCode` 키가 있는 핸들러 반환값
+```
+
+의도적으로 모든 것을 잡으려 하지 않아요 — 이 네 가지가 가장 흔한 실수를 잡아 줘요.
+
+## 안티패턴 한눈에
+
+| 패턴 | 왜 잘못인가 | 대체 |
+|---|---|---|
+| 컨트롤러 안에서 `body['cmd']` | 시그니처 주입 우회 | 타입 있는 파라미터 추가 |
+| GSI 키에 `Optional[str] = None` | DynamoDB가 인덱스 속성의 NULL 거부 | `str = ' '` + `.strip()` 검사 |
+| 쿼리에서 `FilterExpression(...)` | 필터된 row에도 청구; limit 깨짐 | 인덱스로 좁히고; Python에서 필터 |
+| 컨트롤러에서 `{'statusCode': 200, 'body': ...}` 반환 | 래퍼가 이중 감쌈 | 평범한 dict 반환 |
+| 컨트롤러 안 `try/except AppError:` | 비즈니스 에러를 모니터링에서 숨김 | 버블링 시키세요 |
+| 핫패스의 `time.sleep(...)` | 람다 청구 초 낭비 | SQS나 Step Functions로 재설계 |
+| 프로덕션 로그용 `print(...)` | 필터 어려움, 구조 없음 | `print(json.dumps(...))` 또는 Firehose |
+| 모듈 최상위의 `import api` + 최상위의 `api.secret_manager.get_secret_value(...)` | 콜드스타트에 SecretsManager init 강제 | 함수로 래핑 |
+
+## 코드 리뷰 체크리스트
+
+sawsi PR 리뷰 시 사용하세요.
+
+```
+[ ] cmd 라우팅 prefix가 변하지 않거나 의도적으로 확장됨
+[ ] 새 모델이 @sync와 올바른 _table/_indexes를 가짐
+[ ] Sparse GSI 필드가 ' ' 기본값
+[ ] 사용자 대면 경로에 FilterExpression 없음
+[ ] 컨트롤러 파라미터가 명명됨 (body 언패킹 X)
+[ ] 컨트롤러가 AppError raise (에러 dict 반환 X)
+[ ] 새 AWS 리소스가 api.py에 반영됨
+[ ] aws_iam_policy_dev.json과 aws_iam_policy_prod.json이 함께 갱신됨
+[ ] 새 함수 출시 시 LAMBDAS 배열 갱신
+[ ] prod 핸들러에 use_traceback=True 없음
+[ ] 구조화 로깅 밖의 print() 없음
+```
+
+PR이 이 모두를 통과하면 아마 준비 완료된 거예요.
+
+## 가장 흔한 실수 하나
+
+`aws_iam_policy_dev.json`을 갱신할 때 `aws_iam_policy_prod.json` 갱신을 잊는 거예요. dev 배포는 통과해요. 시간이 지나서 누군가 새 엔드포인트에 도달하면 prod 배포 첫 실패가 와요. 오콜이 작성하지도 않은 "AccessDeniedException"으로 호출되죠.
+
+습관으로 만드세요. 모든 PR 설명에 `git diff aws_iam_policy_*.json`을 넣어 보세요.

@@ -1,0 +1,181 @@
+---
+title: Lazy initialization & cold start
+description: How LazyLoadedAPI keeps api.py import-time free, and how it interacts with Lambda container lifecycle.
+---
+
+The reason `api.py` can declare ten AWS clients at module level without blowing up your cold start is `LazyLoadedAPI`. This page explains how it works, why it matters, and the subtle interactions with Lambda container reuse you should know about.
+
+## The class
+
+```python title="sawsi/shared/class_util.py"
+import threading
+
+class LazyLoadedAPI:
+    def __init__(self, api_class, *args, **kwargs):
+        self.api_class = api_class
+        self.args = args
+        self.kwargs = kwargs
+        self._instance = None
+        self._lock = threading.Lock()
+
+    def _initialize_instance(self):
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:
+                    self._instance = self.api_class(*self.args, **self.kwargs)
+
+    def __getattr__(self, name):
+        self._initialize_instance()
+        return getattr(self._instance, name)
+```
+
+Three things happen:
+
+- The constructor **does not create the wrapped API client** — it just stores constructor arguments.
+- The first attribute access triggers `_initialize_instance`, which constructs the real client (`DynamoDBAPI(...)`, `S3API(...)`, etc.).
+- The construction is guarded by a `threading.Lock` and a double-check, so concurrent attribute access on a cold instance creates the client exactly once.
+
+## Why it matters
+
+### 1. Module import becomes free
+
+```python
+# api.py
+dynamo: DynamoDBAPI = LazyLoadedAPI(DynamoDBAPI, f'{env}-{project}', region=region)
+s3_public: S3API   = LazyLoadedAPI(S3API,         f'{env}-{project}-public', region=region)
+secret_manager     = LazyLoadedAPI(SecretManagerAPI, f'{env}/{project}', region=region)
+...
+```
+
+Importing this module instantiates **ten** `LazyLoadedAPI` objects — each one just stashes its constructor arguments. No boto3 clients are created, no AWS credentials are touched, no HTTP connections are opened.
+
+Without `LazyLoadedAPI`, every `api.py` import would build ten boto3 clients. That's about 200–500ms of CPU + an attempt to read credentials, every cold start, even if the request only touches one of them.
+
+### 2. Build time stays AWS-free
+
+`build_keeper.py` imports `api.py` to call `api.dynamo.create_table(...)`. Without lazy loading, the import alone would need AWS credentials — and your local `python build_keeper.py` would fail before doing anything.
+
+With lazy loading, you can `import api` from any context (local dev, CI without AWS, doc generation) and only the calls that actually need AWS will require credentials.
+
+### 3. Tests can import freely
+
+```python
+def test_some_logic():
+    from main.service import some_service
+    # `some_service` imports `api` to do `api.dynamo.query(...)` later
+    # — but importing it doesn't open any DynamoDB connection
+    ...
+```
+
+You can write unit tests against business logic without mocking AWS, as long as the test doesn't actually call into an `api.*` method.
+
+## Cold start interaction
+
+A Lambda **container** lives from a cold start until AWS recycles it (typically minutes to hours of inactivity, or platform updates). All `LazyLoadedAPI` instances live in that container's memory.
+
+The **first** request after a cold start triggers initialization for whatever services that request touches. A login request touches `api.dynamo` and `api.secret_manager` — those two get initialized, the other eight stay lazy.
+
+The **second** request inside the same container is warm: the relevant API clients are already constructed, and subsequent calls reuse them.
+
+This means:
+
+- **The first request is slightly slower** for the AWS clients it uses. Typical cost: 50–150ms per client.
+- **Subsequent requests are fast** until the container is recycled.
+- **A scheduler Lambda that runs every minute** stays warm continuously, so cold-start cost is paid roughly once.
+- **A rarely-invoked Lambda** pays cold-start cost on most invocations.
+
+If cold-start latency is critical for a specific function, use Lambda **Provisioned Concurrency** to keep N containers always warm.
+
+## SecretsManager cache and rotation
+
+`SecretManagerAPI` keeps an **instance-level cache** of decrypted secret values. Since the wrapper instance lives for the container's lifetime, the cache lives that long too.
+
+```python
+key1 = api.secret_manager.get_secret_value('openai_key')   # KMS decryption
+key2 = api.secret_manager.get_secret_value('openai_key')   # in-memory cache
+key3 = api.secret_manager.get_secret_value('slack_webhook') # KMS decryption (different key)
+```
+
+Implications:
+
+- **Cost.** KMS decryption is per-call billed. Caching saves money on hot paths.
+- **Rotation.** Rotating a secret in AWS does **not** invalidate cached values. Existing warm containers keep using the old value until they recycle (minutes to hours). New cold-start containers pick up the new value.
+
+If you must propagate a rotated secret immediately, force a redeploy — that recycles all containers.
+
+## Anti-patterns
+
+### Calling AWS from module top-level
+
+```python
+# WRONG
+import api
+ALLOWED_IPS = api.secret_manager.get_secret_value('allowed_ips').split(',')
+```
+
+This forces `api.secret_manager` to initialize at module import time and makes a KMS call. Move it into a function or a lazy property:
+
+```python
+# RIGHT
+_ALLOWED_IPS = None
+def allowed_ips():
+    global _ALLOWED_IPS
+    if _ALLOWED_IPS is None:
+        _ALLOWED_IPS = api.secret_manager.get_secret_value('allowed_ips').split(',')
+    return _ALLOWED_IPS
+```
+
+### Instantiating wrappers outside api.py
+
+```python
+# WRONG — creates a new client on every call
+def handler(event, context):
+    s3 = S3API(bucket_name, region=region)
+    s3.upload_file(...)
+```
+
+`S3API` construction is expensive (it lazy-creates a boto3 client). Always go through `api.py`. The linter in agent-skills (`sawsi_lint.py`) catches this pattern.
+
+### Reaching into `_instance`
+
+```python
+# WRONG
+client = api.dynamo._instance._raw_dynamo_client
+```
+
+The underscore prefix is the contract — those are internals. Use the wrapper's public methods.
+
+## Container lifecycle quirks
+
+- **Concurrent invocations** of the same Lambda spin up additional containers. Each container has its own copy of all `LazyLoadedAPI` instances.
+- **Reserved Concurrency** of 1 forces a single container — useful when you want a strict singleton for some external resource handle.
+- **`/tmp` is per-container**, 512 MB by default. If you're caching files there, remember they're per-container, not per-request.
+
+## Profiling cold start
+
+Add markers in `aws_handler.py`:
+
+```python
+import time
+IMPORT_T = time.time()
+import api
+API_IMPORTED_T = time.time()
+
+@aws_handler_wrapper(...)
+def handler(event, context):
+    print(f'handler invoked: api_imported={API_IMPORTED_T - IMPORT_T:.3f}s '
+          f'first_request={time.time() - API_IMPORTED_T:.3f}s')
+    ...
+```
+
+Subtract the two markers to see how long `import api` took versus how much of the request latency is in your handler logic.
+
+## What this is *not*
+
+- Not a singleton enforcement mechanism. If you instantiate `S3API(...)` directly somewhere, you get a separate client. The convention is `api.py`-only; the linter catches violations.
+- Not an async-safe lock. The `threading.Lock` works for thread-pool concurrency inside a Lambda but not for asyncio. Don't put `LazyLoadedAPI` inside async code.
+
+## Next
+
+- [Security posture](/docs/deployment/security) — what's on top of this foundation.
+- [Multi-Lambda layout](/docs/architecture/multi-lambda) — how cold-start strategy varies per function.

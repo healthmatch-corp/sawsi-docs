@@ -1,0 +1,160 @@
+---
+title: Filtering discipline
+description: Why DynamoDB FilterExpression is forbidden and how to filter safely in Python.
+---
+
+`DynamoModel.query()` and `.generate()` expose a `filter_expression=` argument backed by a `sawsi.shared.filter_exp_util.Exp` DSL. **You should not use it.** This page explains the reasoning and the convention sawsi enforces instead.
+
+## What `FilterExpression` actually does
+
+DynamoDB's `FilterExpression` runs **after** items are read by the query engine and **before** they are returned to the client. Three consequences:
+
+### 1. Read capacity is billed for filtered-out items
+
+If your query partition has 10,000 items and `FilterExpression` keeps only 50, DynamoDB still reads and charges you for all 10,000. The filter is rendering-side, not query-side.
+
+### 2. `limit` loses its meaning
+
+`limit=20` means "read 20 items from the index, then apply the filter". You typically get back **fewer than 20** matching items. You either:
+
+- Loop with progressively larger `start_key` values to top up the page, or
+- Accept that pagination is broken.
+
+Both are bug factories.
+
+### 3. The index design hides
+
+A `FilterExpression` makes the query *look* like it works, so the team never builds the GSI that would have made the operation efficient. Six months later you have a 200 GB table and queries that read it all.
+
+## The convention
+
+```python
+# 1. Narrow with the index — partition + sort key + sk_condition
+items, end_key = User.query(
+    pk_field='u_b', pk_value='_',
+    sk_condition='gte', sk_value=cutoff_ts,
+    limit=200,
+)
+
+# 2. Filter in Python by attribute access
+active = [u for u in items if u.status == 'active' and u.country == 'KR']
+```
+
+Three rules:
+
+1. **Use indexes for the cardinality reduction.** Pick (or create) a GSI whose partition + sort key brings the candidate set down to a few thousand rows.
+2. **Filter the remainder in Python.** The candidates are already Pydantic instances; attribute access is type-safe and free.
+3. **If the candidate set is still huge, the index is wrong.** Stop and redesign — do not paper over it with `FilterExpression`.
+
+## Concrete examples
+
+### Find unread notifications for a user
+
+Bad:
+
+```python
+notifs, _ = Notification.query(
+    pk_field='user_id', pk_value=user.id,
+    filter_expression=Exp('read', 'eq', False),
+)
+```
+
+Good — add an index:
+
+```python
+class Notification(DynamoModel):
+    _indexes = [
+        ('user_id', 'crt'),
+        ('user_id_unread', 'crt'),     # composite key, see below
+    ]
+    user_id: str
+    user_id_unread: str = ' '
+    read: bool = False
+
+    def mark_read(self):
+        self.read = True
+        self.user_id_unread = ' '       # remove from sparse index
+        self.update()
+
+    @classmethod
+    def new(cls, user_id):
+        return cls(user_id=user_id, user_id_unread=user_id)   # join field
+```
+
+Unread query becomes:
+
+```python
+notifs, _ = Notification.query(pk_field='user_id_unread', pk_value=user.id)
+```
+
+Bills only for actually-unread notifications.
+
+### Search by name prefix
+
+Bad: `FilterExpression('name', 'stw', query_text)` over the whole table.
+
+Good: use the [SearchEngine n-gram index](/docs/services/ai-vector-search) which sawsi ships specifically for this.
+
+### "List with optional filters" controller
+
+```python
+@controller
+def list_events(
+    region: str | None = None,
+    sport_id: str | None = None,
+    start_key: dict | None = None,
+    **kwargs,
+):
+    # Pick the most selective index available
+    if sport_id:
+        items, end_key = Event.query(
+            pk_field='sport_id', pk_value=sport_id, sk_field='start_ts',
+            start_key=start_key, limit=20,
+        )
+    elif region:
+        items, end_key = Event.query(
+            pk_field='region1', pk_value=region, sk_field='crt',
+            start_key=start_key, limit=20,
+        )
+    else:
+        items, end_key = Event.query(limit=20, start_key=start_key)
+
+    # Post-filter in Python for the *other* parameter, if it slipped through
+    if sport_id and region:
+        items = [e for e in items if e.region1 == region]
+
+    return {'items': [e.model_dump() for e in items], 'cursor': end_key}
+```
+
+Note the controller selects the index it'll use; if both filters are given, the more-selective one drives the query and the other is checked in Python.
+
+## When you really do need Exp
+
+The `Exp` DSL exists because some edge cases (admin tooling, ad-hoc analytics) need server-side filtering. **You can use it there**, with eyes open:
+
+- One-off scripts where read cost is acceptable.
+- Admin views that page over thousands of rows but display only a few — the user has time to wait.
+
+For anything user-facing, the answer is "no". And if your code has more than two or three uses of `FilterExpression`, treat it as a design alarm: the schema needs more indexes.
+
+## What about pagination with Python filtering?
+
+You may need to read more than `limit` rows from the index to get `limit` filtered results:
+
+```python
+def list_active_users(limit=20, start_key=None):
+    out = []
+    while len(out) < limit:
+        items, end_key = User.query(limit=200, start_key=start_key)
+        out.extend(u for u in items if u.status == 'active')
+        if end_key is None:
+            break
+        start_key = end_key
+    return out[:limit], end_key
+```
+
+This is also acceptable but capped — if you find yourself reading 10,000 rows to get 20 actives, the schema is wrong.
+
+## Linter coverage
+
+The agent-skills harness (`sawsi_lint.py`) does not catch `FilterExpression` use directly because the import surface is too generic. Review for it manually during code review.

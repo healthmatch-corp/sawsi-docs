@@ -1,0 +1,184 @@
+---
+title: AI 코딩 에이전트를 위해
+description: agent-skills-sawsi harness — Claude Code와 친구들을 위한 skill, 슬래시 명령, lint hook, 그리고 eval 태스크를 소개해요.
+---
+
+AI 코딩 에이전트(Claude Code, Cursor 등)의 도움으로 sawsi 프로젝트를 만든다면, 이 핸드북에 문서화된 컨벤션을 에이전트에게 가르치는 별도 패키지 — `agent-skills-sawsi` — 가 있어요. 이 페이지가 그 안의 내용과 사용법을 둘러보는 투어예요.
+
+## harness가 출시하는 것
+
+```
+agent-skills-sawsi/
+├── .agents/
+│   ├── skills/
+│   │   ├── sawsi-conventions/      # api.py / build_keeper / env 네이밍
+│   │   ├── sawsi-dynamomodel/      # DynamoModel ORM 규칙
+│   │   ├── sawsi-filter-exp/       # FilterExpression 금지
+│   │   ├── sawsi-handler-and-router/   # @controller, router, 응답 모양
+│   │   ├── sawsi-oauth/             # 2단계 login/register 패턴
+│   │   ├── sawsi-services/          # S3 / Locking / Firehose / SES / SMS / SQS / SecretsManager
+│   │   └── sawsi-deploy/            # buildspec + Docker + IAM
+│   ├── commands/
+│   │   ├── sawsi-add-controller.md  # /sawsi-add-controller
+│   │   └── sawsi-add-model.md       # /sawsi-add-model
+│   ├── hooks/
+│   │   └── sawsi_lint.py            # Stop-hook 린터
+│   └── settings.json                # 훅 연결
+├── templates/
+│   └── CLAUDE.md.template
+├── evals/
+│   └── tasks/                       # 다섯 가지 회귀 시나리오
+└── README.md
+```
+
+## 일곱 가지 skill
+
+각자 에이전트가 관련 컨텍스트를 감지할 때 읽는 단일 `SKILL.md` 파일이에요. 이 핸드북의 챕터에 매핑돼요:
+
+| Skill | 매핑 |
+|---|---|
+| `sawsi-conventions` | [멘탈 모델](/docs/introduction/mental-model), [컨벤션](/docs/practice/conventions) |
+| `sawsi-dynamomodel` | [DynamoModel](/docs/data/dynamomodel) |
+| `sawsi-filter-exp` | [필터링 원칙](/docs/data/filtering) |
+| `sawsi-handler-and-router` | [요청 라이프사이클](/docs/handlers/request-lifecycle), [트리거](/docs/handlers/triggers), [에러](/docs/architecture/errors) |
+| `sawsi-oauth` | [OAuth & 소셜 로그인](/docs/auth/oauth) |
+| `sawsi-services` | [AWS 서비스 래퍼](/docs/services/aws-wrappers) |
+| `sawsi-deploy` | [배포](/docs/deployment/deployment), [IAM](/docs/deployment/iam) |
+
+skill은 응축돼 있어요 — bullet, 코드 stub, 함정 위주라서 에이전트가 전체 산문에 컨텍스트를 쓰지 않고도 로드할 수 있어요. 산문보다 간결한 걸 선호한다면 직접 빠른 레퍼런스로 써도 좋아요.
+
+## 두 가지 슬래시 명령
+
+### `/sawsi-add-controller <app>.controller.<module>.<func_name>`
+
+컨트롤러 stub을 생성해요:
+
+```python
+from sawsi.handler.controller_decorator import controller
+import errs
+
+@controller
+def <func_name>(<explicit_params>, **kwargs):
+    """
+    <한 줄 설명>
+    """
+    # TODO: 비즈니스 로직
+    return {}
+```
+
+강제하는 것들:
+
+- `@controller` 데코레이터.
+- 명명된 파라미터예요 (`body` 언패킹은 안 써요).
+- `**kwargs`로 흡수해요.
+- 실패에는 `raise errs.*`를 써요 (raw `Exception`은 안 써요).
+- 반환값에 `statusCode`/`headers`는 넣지 않아요.
+
+### `/sawsi-add-model <ModelName> [<field1>,<field2>,...]`
+
+DynamoModel stub을 생성해요:
+
+```python
+import api
+from sawsi.model.base import DynamoModel, sync
+
+@sync
+class <ModelName>(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = '<table_name>'
+    _indexes = [
+        ('<field1>', None),
+        ('<field2>', 'crt'),
+    ]
+
+    # TODO: 비즈니스 필드 추가
+```
+
+강제하는 것들:
+
+- `@sync` (그래야 `sync_all_models`이 찾아요).
+- `__dynamo__ = api.dynamo`.
+- `id` / `crt` / `u_b`는 재정의하지 않아요.
+
+## lint hook
+
+`sawsi_lint.py`가 에이전트의 Stop 훅에서 실행돼요 — 에이전트가 턴을 마칠 때마다 돌아요. git diff를 순회하면서 다음을 깃발로 표시해요:
+
+1. **`import boto3` 또는 `from boto3 ...`** — `import api` + `api.<service>` 형태여야 해요.
+2. **하드코딩된 `'dev-...'` / `'prod-...'` 리소스 문자열** — `f'{env}-{project}-...'`여야 해요.
+3. **`@sync`가 없는 DynamoModel 서브클래스** — 테이블이 생성 안 돼요.
+4. **리터럴 `statusCode` 키를 가진 핸들러 반환값** — 래퍼가 이중으로 감싸 버려요.
+
+매칭이 있으면 hook이 에이전트의 "작업 완료" 상태를 구조화된 에러 메시지로 차단해요 — 에이전트가 계속하기 전에 수정하거나 정당화해야 해요.
+
+의도적으로 모든 것을 린트하려고 하지는 않아요 — 이 네 패턴이 가장 흔한 입문자 실수예요. 나머지는 skill과 인간 리뷰어가 커버해요.
+
+## 다섯 가지 eval 태스크
+
+`evals/tasks/`에 harness 변경의 회귀 테스트로 쓰이는 다섯 시나리오가 들어 있어요:
+
+1. **User 모델 추가** — 에이전트가 `@sync`, `__dynamo__`, 올바른 `_indexes`를 내놓고, 필드를 재정의하지 않는지 확인해요.
+2. **User 쿼리 페이지네이션** — 에이전트가 `(items, cursor)`를 반환하고 FilterExpression을 쓰지 않는지 확인해요.
+3. **로그인 컨트롤러 + 핸들러 통합** — 에이전트가 새 `errs.*`를 정의하고, `@controller`를 쓰며, `allowed_cmd_prefixes`를 통해 라우팅하는지 확인해요.
+4. **`.update()` NoOp 버그 수정** — 에이전트가 `__modified_attributes__` 시맨틱을 인식하고 `force_update_default_fields`를 쓰는지 확인해요.
+5. **새 S3 버킷 추가** — 에이전트가 `aws_iam_policy_dev.json`과 `aws_iam_policy_prod.json` 둘 다 갱신하는지 확인해요.
+
+skill이나 hook을 바꿨다면 회귀하지 않았는지 확인하려고 이걸 재실행해 주세요.
+
+## 프로젝트에 harness 설치하는 법
+
+### 옵션 A — 파일 vendoring
+
+```bash
+cd /path/to/your/project
+cp -R /path/to/agent-skills-sawsi ./agent-skills-sawsi
+
+ln -s agent-skills-sawsi/.agents .claude
+cp agent-skills-sawsi/templates/CLAUDE.md.template ./CLAUDE.md
+```
+
+`CLAUDE.md`를 편집해서 프로젝트 고유 앱 이름, 트리거, 비표준 패턴을 채워 주세요.
+
+### 옵션 B — git submodule
+
+```bash
+git submodule add <agent-skills-sawsi-repo-url> agent-skills-sawsi
+git submodule update --init --recursive
+
+mkdir -p .agents/skills .agents/commands .agents/hooks
+ln -s .agents .claude
+
+for d in agent-skills-sawsi/.agents/skills/*; do
+  ln -s "../../$d" ".agents/skills/$(basename "$d")"
+done
+# command와 hook도 비슷하게 해 주세요
+```
+
+이렇게 해 두면 파일을 복사하지 않고도 `git submodule update --remote`로 harness 업데이트를 끌어올 수 있어요.
+
+## CLAUDE.md.template
+
+`templates/CLAUDE.md.template`에 들어 있어요. 프로젝트 루트로 복사한 다음 채워 주세요:
+
+- 프로젝트 이름과 AWS 리전.
+- 어떤 앱이 있는지 (`main`, `admin`, `queue_receiver` 등)와 트리거.
+- `api.py`에 선언된 AWS 서비스.
+- 사용 중인 `cmd` prefix 컨벤션.
+- 에이전트가 알아야 할 프로젝트 고유 비표준 패턴.
+
+harness의 CLAUDE.md는 skill **이전에** 읽혀요. 그래서 거기에 쓴 내용이 skill의 기본 가이드를 오버라이드하거나 정제할 수 있어요.
+
+## 이게 어디에 맞는가
+
+에이전트 harness는 **프레임워크가 아니에요**. AI 에이전트(또는 새 인간 팀원)가 컨벤션을 존중하는 sawsi 코드를 출시하도록 돕는 위 계층이에요. 컨벤션 자체는 이 핸드북에 들어 있어요.
+
+AI 에이전트를 쓰지 않는다면 harness는 무해해요 — `.claude/` 디렉터리를 무시하면 돼요. 쓴다면 한 번 설치하기만 해도 에이전트가 1년차 시니어 sawsi 개발자의 본능을 갖게 돼요.
+
+## 이슈 신고
+
+두 가지 repo가 있어요:
+
+- 프레임워크 버그: `simple-aws-interface` 이슈로 올려 주세요.
+- harness 개선: `agent-skills-sawsi` 이슈로 올려 주세요.
+
+이 핸드북이 말하는 것과 일치하지 않는 skill이 있다면 버그예요 — 이슈로 등록해 주세요.

@@ -1,0 +1,196 @@
+---
+title: API reference
+description: Modules, classes, environment variables, response codes, glossary.
+---
+
+This page is the at-a-glance reference. For prose explanations, follow the cross-links.
+
+## `sawsi.handler`
+
+| Symbol | Description |
+|---|---|
+| `controller_decorator.controller(func)` | Decorator. Registers `func` in `controller_registry` under `module.func_name`. |
+| `controller_decorator.controller_registry` | Dict of `module.func_name → func`. Populated by import. |
+| `router.router(cmd, body, headers, allowed_cmd_prefixes)` | Validates prefix, dispatches by signature injection. |
+
+## `sawsi.model`
+
+| Symbol | Description |
+|---|---|
+| `base.DynamoModel` | Pydantic-based ORM base class. |
+| `base.sync` | Decorator. Adds the class to `__models_to_sync__`. |
+| `base.sync_all_models(packages: list[str])` | Imports packages, calls `sync_table()` on every `@sync`'d class, 24-thread parallel. |
+| `base.extract_dynamodb_type(annotation)` | Maps Pydantic type annotations to DynamoDB attribute types (`S`, `N`, `B`, etc.). |
+
+### `DynamoModel` instance methods
+
+| Method | Description |
+|---|---|
+| `.put(can_overwrite=False)` | Insert. Raises on duplicate id unless overwriting. |
+| `.update(force_update_default_fields=False)` | Update only modified attributes (NoOp if nothing changed). |
+| `.delete()` | Delete by id. |
+| `.get_attributes_to_update()` | Returns list of attribute names that changed since load. |
+
+### `DynamoModel` class methods
+
+| Method | Description |
+|---|---|
+| `.get(id, consistent_read=True, use_cache=False)` | Fetch one row. |
+| `.batch_get(ids, consistent_read=True)` | Fetch many in parallel. |
+| `.query(pk_field, pk_value, sk_condition, sk_field, sk_value, ..., start_key, limit)` | Returns `(items, end_key)`. |
+| `.generate(pk_field, pk_value, ...)` | Same as query but yields items one at a time. |
+| `.scan(start_key, limit, filter_expression)` | Full-table scan. Avoid in hot paths. |
+| `.sync_table(create_default_index=True)` | Create table + GSIs if missing. |
+
+## `sawsi.aws.<service>.api`
+
+| Service | Class | Construction |
+|---|---|---|
+| DynamoDB | `DynamoDBAPI` | `(group_name, region, credentials=None)` |
+| S3 | `S3API` | `(bucket_name, region, credentials=None)` |
+| Locking | `LockingAPI` | `(table_name, region, credentials=None)` |
+| Firehose | `Firehose` | `(stream_name, bucket_name, key_prefix, region)` |
+| SES | `SESAPI` | `(region, credentials=None)` |
+| SMS | `SMSAPI` | `(region_name='us-east-1', credentials=None)` |
+| SQS | `SQSAPI` | `(queue_url, region, credentials=None)` |
+| SecretsManager | `SecretManagerAPI` | `(secret_name, region, credentials=None)` |
+| API Gateway Mgmt | `APIGatewayManagement` | `(endpoint_url, region, credentials=None)` |
+| SNS | `SNSAPI` | `(region, credentials=None)` |
+| SSM | `SSMAPI` | `(region, credentials=None)` |
+| Lambda | `LambdaAPI` | `(region, credentials=None)` |
+| Logs | `LogsAPI` | `(region, credentials=None)` |
+| Cognito | `CognitoAPI` | `(region, credentials=None)` |
+| Bedrock | `BedrockAPI` | `(region, credentials=None)` |
+| OpenSearch | `OpenSearchAPI` | `(host, region, credentials=None)` |
+| S3 DB | `S3DBAPI` | `(bucket_name, table_name, region, credentials=None)` |
+| S3 Vector | `S3VectorAPI` | `(bucket_name, region, credentials=None)` |
+| Vector KB | `VectorKBAPI` | `(vector_bucket_name, index_name, embed_model_id, dimension, distance_metric, region, credentials=None)` |
+| CodeBuild | `CodeBuildAPI` | `(region, credentials=None)` |
+| CodeCommit | `CodeCommitAPI` | `(region, credentials=None)` |
+| IAM | `IAMAPI` | `(region, credentials=None)` |
+
+## `sawsi.shared`
+
+| Module | Symbol | Description |
+|---|---|---|
+| `handler_util` | `aws_handler_wrapper(error_receiver, content_type, use_traceback, ignore_app_errors)` | Decorator factory. |
+| `handler_util` | `AWSResponse(body, content_type, status_code, charset)` | API Gateway response builder. |
+| `handler_util` | `get_body(event, context)` | Parses JSON body from event. |
+| `handler_util` | `get_headers(event, context)` | Returns lowercased headers dict. |
+| `handler_util` | `get_source_ip(event, context)` | Returns source IP. |
+| `error_util` | `AppError(code, message)` | Application error. |
+| `error_util` | `SYSTEM_NO_SUCH_CMD` | `AppError('B00001', ...)` |
+| `error_util` | `Command_Prefix_not_allowed` | `AppError('B00006', ...)` |
+| `class_util` | `LazyLoadedAPI(api_class, *args, **kwargs)` | Lazily constructed wrapper. |
+| `dict_util` | `convert_number_to_decimal(d)` / `convert_decimal_to_number(d)` | float ↔ Decimal. |
+| `filter_exp_util` | `Exp(field, condition, value)` + `.and_()` / `.or_()` | DSL for DynamoDB filter expressions. **Use sparingly.** |
+| `function_util` | `auto_cache`, `synchronized`, `try_run` | Decorators / helpers. |
+| `hash_util` | `make_salt()`, `hash_password(plain)`, `validate_password(plain, hash)` | PBKDF2-based password helpers. |
+| `list_util` | `divide_chunks(lst, n)` | Generator yielding chunks. |
+| `set_util` | `HashableDict(d, keys_to_hash)` | Dict that hashes on a subset of keys. |
+| `schedule_util` | `ScheduledTask(cron_expression)` (context manager) | Cron-matched scheduling helper. |
+| `schedule_util` | `join()` | Wait for all `ScheduledTask`-launched threads. |
+| `aws_es_proxy_util` | `install_aws_es_proxy()` | Local helper for OpenSearch dev. |
+
+## `sawsi.service`
+
+| Symbol | Description |
+|---|---|
+| `searchengine.SearchEngine(dynamo_db_api, table_name)` | Korean-friendly n-gram autocomplete index over DynamoDB. |
+
+## `sawsi.api_doc`
+
+| Symbol | Description |
+|---|---|
+| `doc_generator.DocMaker(entry_function, base_url, test_function)` | Test-as-documentation tool. |
+| `doc_generator.APIInfo` | Dataclass for one endpoint's recorded shape. |
+
+## Environment variables
+
+| Name | Set in | Read in |
+|---|---|---|
+| `env` | Lambda function config, Dockerfile `--build-arg` | `config.env` |
+| `AWS_DEFAULT_REGION` | Lambda runtime / Dockerfile | boto3 default |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | Lambda runtime | boto3 default |
+| `LANGSMITH_*`, `OPENAI_API_KEY`, etc. | `api.py` from `secret_manager` | Application code |
+
+## Boilerplate file inventory
+
+| File | Role |
+|---|---|
+| `api.py` | LazyLoadedAPI singletons for all AWS clients. |
+| `config.py` | Reads env, sets region, build flag. |
+| `errs.py` | `AppError` instances for the project. |
+| `build_keeper.py` | Deploy-time resource initialization. |
+| `requirements.txt` | Python dependencies. |
+| `Dockerfile.main` | Container image for API-Gateway-style Lambdas. |
+| `Dockerfile.sqs` | Container image for workers (typically with ffmpeg). |
+| `buildspec-{lambda,docker}-{dev,prod}.yml` | CodeBuild orchestration. |
+| `aws_iam_policy_{dev,prod}.json` | IAM policy templates, env-prefix scoped. |
+
+## Response codes at a glance
+
+| Range | Meaning | Defined where |
+|---|---|---|
+| `A00000` | Success | Wrapper |
+| `B00xxx` | Library error | `sawsi.shared.error_util` |
+| `B1xxxx`, `S0001+`, etc. | App error | `errs.py` |
+| `U99999` | Unknown exception | Wrapper |
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| **cmd** | Dot-separated import path used for routing: `<app>.controller.<module>.<func>`. |
+| **handler** | The `aws_handler.py:handler(event, context)` function. Lambda entrypoint. |
+| **controller** | `@controller`-decorated function. Receives request fields by signature injection. |
+| **service** | Module of functions that orchestrate models and external services. |
+| **dao** | Data-access module for queries/aggregations beyond a single model. |
+| **wrapper** | A `sawsi.aws.<service>.api.*API` class. Thin boto3 wrapper. |
+| **sync** | `@sync` decorator + `sync_all_models()` — the DynamoDB schema migration entry point. |
+| **u_b** | Universal Bucket — automatic field always `'_'`, used as default GSI partition key. |
+| **rslt_cd** | Top-level response code (`A00000`, `B*`, `U99999`). |
+| **AppError** | The framework's exception type for business errors. |
+| **LazyLoadedAPI** | Wrapper that defers AWS client construction until first attribute access. |
+| **ScheduledTask** | Context-manager-based cron matcher for the scheduler Lambda. |
+| **SparseGSI** | A GSI whose key field uses `' '` default so absent rows don't appear in the index. |
+
+## FAQ
+
+**Q. Can I deploy via plain `zip` instead of container images?**
+A. The boilerplate ships `buildspec-lambda-{env}.yml` for that path. Use it if your project's deps are small. Most non-trivial projects benefit from the container path because `build_keeper.py` runs inside the build.
+
+**Q. Can I run multiple cmds in a single API Gateway request?**
+A. No. One request = one `cmd` = one controller. If you want batching, write a single cmd that orchestrates.
+
+**Q. How do I cache expensive computations between Lambda invocations?**
+A. Module-level globals survive within a container. For cross-container caching, use DynamoDB with a TTL.
+
+**Q. Can I use this with FastAPI or another framework?**
+A. The handler is plain Python — you can call it from anywhere. But the conventions assume the Lambda entrypoint; running under FastAPI is unusual.
+
+**Q. How do I deal with binary uploads (images, video)?**
+A. Use presigned S3 PUT URLs (`api.s3_uploads.create_presigned_url_put_object(key)`); the client uploads directly, then notifies the API the upload is done. Don't proxy binary through API Gateway.
+
+**Q. What about WebSockets at scale?**
+A. Each connection is a row in `WsConnection`. To push to N connections, iterate and call `api.apigw.post_to_connection` in parallel. For very large fan-out, queue the push to SQS and let workers fan out.
+
+## Where the code lives
+
+- Library source: `simple-aws-interface` repository (the `sawsi` package).
+- Reference best-practice project: `hm-serverless` repository.
+- Agent harness: `agent-skills-sawsi` repository.
+
+See [Agent Skills](/docs/reference/agent-skills) for the harness layout.
+
+## Versioning
+
+The library version is in `setup.py`. Current series is `20.x`. Patch releases are backward-compatible; minor releases may add deprecation warnings.
+
+To upgrade:
+
+```bash
+pip install -U sawsi
+```
+
+Then re-read your project's `api.py` against the new `sawsi_boilerplate/api.py` to spot any new wrappers worth adopting.

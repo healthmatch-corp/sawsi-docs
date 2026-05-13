@@ -1,0 +1,261 @@
+---
+title: DynamoModel
+description: A Pydantic-typed ORM for DynamoDB with automatic fields, GSI declaration, and sparse-index support.
+---
+
+`DynamoModel` is the data layer of sawsi. It is a thin Pydantic v2 base class that turns a Python class into a DynamoDB table — with automatic primary key, sort key, and a built-in "all rows" index.
+
+## A complete model
+
+```python title="main/model/user.py"
+from typing import Optional
+from sawsi.model.base import DynamoModel, sync
+import api
+
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [
+        ('phone', None),
+        ('google_social_id', None),
+        ('apple_social_id', None),
+        ('u_b', 'geohash'),
+    ]
+
+    name: str
+    birth: str
+    phone: str = ' '
+    email: Optional[str] = None
+
+    google_social_id: str = ' '
+    apple_social_id: str = ' '
+
+    lat: float = 0
+    lng: float = 0
+    geohash: str = ' '
+
+    following_count: int = 0
+    is_official: bool = False
+```
+
+Six things to register from this snippet.
+
+## 1. The `@sync` decorator
+
+`@sync` registers the class in a module-level list called `__models_to_sync__`. At deploy time, `build_keeper.py` calls `sync_all_models(['main.model'])` which:
+
+1. Imports every module under `main.model` (so the `@sync` calls fire).
+2. Walks `__models_to_sync__` and calls `cls.sync_table()` on each in 24 parallel threads.
+
+`sync_table()` creates the table if missing and adds any new GSIs declared in `_indexes`. It is idempotent.
+
+<Callout type="warn">
+Forget `@sync` and your model exists in Python but **not in DynamoDB**. The first call that hits it raises `ResourceNotFoundException` in production. This is the single most common newbie mistake.
+</Callout>
+
+## 2. `__dynamo__` — which DynamoDB to use
+
+All sawsi models point at the singleton in `api.py`:
+
+```python
+__dynamo__ = api.dynamo
+```
+
+`api.dynamo` is a `DynamoDBAPI(group_name=f'{env}-{project}')`. The `group_name` is a **prefix**; the actual table name becomes `{env}-{project}_{_table}`. So this `User` class becomes:
+
+| env | Table name |
+|---|---|
+| dev | `dev-myproject_user` |
+| prod | `prod-myproject_user` |
+
+The same Python code creates different DynamoDB tables in different environments — driven entirely by `config.env`.
+
+## 3. Automatic fields you don't write
+
+Every `DynamoModel` already has:
+
+```python
+id: str  = uuid.uuid4()      # partition key
+crt: float = time.time()      # sort key (created timestamp)
+u_b: str = '_'                # "universal bucket", always '_'
+```
+
+| Field | Purpose |
+|---|---|
+| `id` | Primary partition key. UUID4 string. Generated on construction. |
+| `crt` | Default sort key. Float UNIX timestamp. Generated on construction. |
+| `u_b` | Partition key of a free built-in GSI that lets you query "all rows ordered by `crt`". Always `'_'`. |
+
+Do **not** redefine these in your subclass. The framework relies on the defaults and on `u_b` being a constant.
+
+## 4. `_indexes` — declaring GSIs
+
+`_indexes` is a list of `(partition_key_field, sort_key_field)` tuples. Each tuple becomes a Global Secondary Index.
+
+```python
+_indexes = [
+    ('phone', None),              # GSI on phone only
+    ('u_b', 'geohash'),           # secondary "all rows" index keyed by geohash
+    ('creator_id', 'crt'),        # events created by user, in time order
+]
+```
+
+The framework also auto-creates the index `(u_b, crt)` unless you opt out with `__create_default_index__ = False`. So `User.query()` with no arguments returns all users in time order, for free.
+
+## 5. Sparse GSI fields — the `' '` pattern
+
+DynamoDB cannot index `NULL`. If you have a field that is sometimes absent — like `google_social_id` for users who signed up with email — you cannot mark it `Optional[str] = None`, because Pydantic will dump `None` and boto3 will translate that to a `NULL` attribute. The next put on that record will fail with `ValidationException`.
+
+The convention is to default to a **single blank space**:
+
+```python
+google_social_id: str = ' '   # one space, not '' and not None
+```
+
+Why a space and not an empty string? Some boto3 paths still treat `''` as missing and the field disappears entirely from the row. A literal `' '` survives serialization and keeps the GSI a *true* sparse index (rows with the default value are still indexed under the key `' '`, but you simply never query for that value).
+
+When checking whether the field is "really set", use `.strip()`:
+
+```python
+if user.google_social_id.strip():
+    ...   # actually has a value
+```
+
+This pattern applies to every GSI key field that might be absent: `phone`, `email`, `invite_code`, `anon_nickname`, etc.
+
+## 6. CRUD operations
+
+```python
+# Create
+user = User(name='Kim', birth='1990-01-01')
+user.put()                       # raises on duplicate id
+user.put(can_overwrite=True)     # overwrite existing
+
+# Read
+user = User.get('user-uuid')                                # → User | None
+users = User.batch_get(['id1', 'id2', 'id3'])               # parallel, 32 threads max
+
+# Update — only changed fields are written
+user.name = 'Lee'
+user.update()                                                 # writes name only
+
+# Delete
+user.delete()
+```
+
+### The `.update()` no-op trap
+
+`update()` tracks attribute changes via `__setattr__` and only sends fields in `__modified_attributes__`. If you load a model and don't change anything, calling `update()` sends **zero** writes — a silent no-op:
+
+```python
+user = User.get('user-uuid')
+# you forgot to actually mutate user
+user.update()                  # no DynamoDB call, returns user unchanged
+```
+
+If you need to force-write fields that have framework defaults (typically when adding a new field to a schema and back-filling):
+
+```python
+user.update(force_update_default_fields=True)
+```
+
+This adds every field with a default value to the write set, even if unchanged.
+
+## Querying
+
+```python
+# Query the default "u_b" index — all rows by crt
+users, end_key = User.query(limit=20)
+
+# Query a specific GSI
+users, end_key = User.query(pk_field='phone', pk_value='+82-10-1234-5678')
+
+# With a sort-key condition
+users, end_key = User.query(
+    pk_field='u_b', pk_value='_',
+    sk_condition='gte', sk_value=1701432000.0,   # only rows created after this timestamp
+    limit=50,
+)
+
+# Paginate
+users, end_key = User.query(limit=20, start_key=previous_end_key)
+```
+
+`sk_condition` is one of `eq`, `lte`, `lt`, `gte`, `gt`, `btw` (between, requires `sk_second_value`), `stw` (starts with, for strings).
+
+### Implicit sort key
+
+If `pk_field='u_b'` and you omit `sk_field`, sawsi automatically uses `sk_field='crt'` (the default index). This is what makes the simple call `User.query(limit=20)` return time-ordered results without configuration.
+
+### Returning a generator instead
+
+```python
+for user in User.generate(pk_field='u_b', pk_value='_'):
+    process(user)
+```
+
+`generate()` has the same signature as `query()` but yields items one at a time. Use it when you might consume thousands of rows and don't want them all in memory.
+
+### Scan — last resort
+
+```python
+all_users = User.scan(limit=1000)
+```
+
+`scan()` reads every partition. Avoid it in production traffic paths. It exists for one-off jobs and migrations.
+
+## What about `FilterExpression`?
+
+The `DynamoModel` query API technically supports a `filter_expression=Exp(...)` argument that DynamoDB applies server-side. **Do not use it.** The reasons and the recommended pattern are in the next chapter — [Filtering discipline](/docs/data/filtering).
+
+## Pagination contract
+
+Every query returns `(items, end_key)`:
+
+```python
+items, end_key = User.query(limit=20)
+if end_key is None:
+    # last page
+else:
+    next_page, end_key = User.query(limit=20, start_key=end_key)
+```
+
+For clients, return `end_key` as a cursor:
+
+```python
+@controller
+def list_users(start_key: dict | None = None, **kwargs):
+    items, end_key = User.query(limit=20, start_key=start_key)
+    return {
+        'items': [u.model_dump() for u in items],
+        'cursor': end_key,    # client passes this back as start_key
+    }
+```
+
+## Type → DynamoDB conversion
+
+The framework maps Python types to DynamoDB attribute types as you'd expect:
+
+| Python type | DynamoDB |
+|---|---|
+| `str` | `S` |
+| `int`, `float` | `N` |
+| `bytes` | `B` |
+| `bool` | `BOOL` |
+| `list[...]`, `dict[...]` | `L`, `M` |
+| `Optional[str]` (i.e. `str | None`) | `S` (None becomes NULL) — **do not use for GSI keys** |
+| `Literal['a', 'b']` | `S` |
+
+Pydantic does the validation; `dict_util.convert_number_to_decimal` / `convert_decimal_to_number` shuttle between Python `float` and DynamoDB's `Decimal`.
+
+## Where to next
+
+<Cards>
+  <Card title="Filtering discipline" href="/docs/data/filtering">
+    Why FilterExpression is forbidden and what to do instead.
+  </Card>
+  <Card title="Migration recipes" href="/docs/practice/migration">
+    Adding GSIs, renaming fields, migrating None → ' '.
+  </Card>
+</Cards>

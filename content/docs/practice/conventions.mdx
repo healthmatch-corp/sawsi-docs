@@ -1,0 +1,219 @@
+---
+title: Conventions & anti-patterns
+description: The hard rules — file naming, cmd naming, GSI keys, response codes — and the patterns that fail.
+---
+
+This page is the consolidated style guide. Most of these conventions exist because the framework or the agent-skills linter relies on them. Breaking one is the difference between "works in dev, blows up in prod" and "ships clean."
+
+## File and directory naming
+
+| Item | Convention |
+|---|---|
+| Lambda app folders | `<app>/` at the repo root — `main/`, `admin/`, `queue_receiver/`, `scheduler/`, etc. Lowercase, snake_case, no plurals. |
+| Handler entry | `<app>/aws_handler.py`. Always this name. |
+| Controllers | `<app>/controller/<module>.py`. One file per logical group (`auth.py`, `event.py`, `member.py`). |
+| Services | `<app>/service/<module>_service.py`. Suffix is optional but common. |
+| Models | `<app>/model/<table_name>.py`. snake_case, matches the `_table` attribute. |
+| DAO | `<app>/dao/<aggregation>_dao.py`. Use when query logic doesn't fit a single model class. |
+| Migrations | `<app>/migration/<YYYYMMDD>_<description>.py`. |
+
+## cmd naming
+
+```
+<app>.controller.<module>.<function_name>
+```
+
+Examples:
+
+```
+main.controller.member.register
+main.controller.event.create_event
+admin.controller.user.search_by_phone
+queue_receiver.controller.match_queue.start_finding
+```
+
+Three rules:
+
+1. **Always four dot-separated segments.** The router needs the prefix check to pass, and the linter expects this depth.
+2. **Snake_case throughout.** `createEvent` and `CreateEvent` are wrong.
+3. **Function names are verbs.** `get_*`, `list_*`, `create_*`, `update_*`, `delete_*`, plus domain-specific verbs.
+
+## Response shape and codes
+
+```json
+{
+  "rslt_cd": "A00000",
+  "rslt_msg": "요청 성공",
+  "duration": 0.042,
+  ...
+}
+```
+
+The first three keys are framework-injected. Your data goes after.
+
+For codes:
+
+- `A` — success. Only one value (`A00000`). Don't define your own `A` codes.
+- `B0xxxx` — library-reserved. Don't define here.
+- `B1xxxx` and up (`B1`, `B2`, ...) — your application errors. Pick a stable scheme.
+- `S0001`+ — alternative system-error convention (some projects use `S`, `E`, etc. by category).
+- `U99999` — unknown. Wrapper-assigned. Don't return `U` from controllers.
+
+See [Errors & result codes](/docs/architecture/errors).
+
+## DynamoModel hard rules
+
+```python
+@sync                                            # required
+class Event(DynamoModel):
+    __dynamo__ = api.dynamo                       # required, always api.dynamo
+    _table = 'event'                              # snake_case
+    _indexes = [                                  # list of (pk, sk) tuples
+        ('creator_id', 'crt'),
+        ('region1', 'crt'),
+        ('invite_code', None),                    # sparse — see field default below
+    ]
+
+    creator_id: str                               # business fields
+    title: str
+    invite_code: str = ' '                        # sparse GSI: ' ', never None or ''
+
+    # DO NOT redefine these — they exist automatically
+    # id: str
+    # crt: float
+    # u_b: str
+```
+
+The linter (`sawsi_lint.py`) catches missing `@sync` and a few other violations. Things it doesn't catch but matter:
+
+- `Optional[str] = None` on a GSI key.
+- A redefined `id`/`crt`/`u_b`.
+- A `_table` name that doesn't match the file name.
+
+## Controller hard rules
+
+```python
+@controller                                                   # required
+def update_profile(user, name: str, birth: str | None = None, # explicit params
+                   **kwargs):                                  # always accept extras
+    if user is None:
+        raise errs.no_session                                 # raise AppError, never return error dicts
+    user.name = name
+    if birth:
+        user.birth = birth
+    user.update()
+    return {'name': user.name}                                # plain JSON-serializable dict
+```
+
+Don't:
+
+- Receive `body` as a single dict and unpack inside the function. Use signature parameters.
+- Forget `**kwargs`. The handler injects extra keys (`source_ip`, `req_ts`, etc.) that controllers shouldn't have to enumerate.
+- Return `{'statusCode': ..., 'headers': ..., 'body': ...}` — the wrapper does the wrapping.
+- Catch `AppError` inside the controller. Let it bubble.
+
+## Handler hard rules
+
+```python
+@handler_util.aws_handler_wrapper(
+    error_receiver=slack_notify,           # set this for prod
+    use_traceback=False,                    # False in prod, True in dev
+    ignore_app_errors=[errs.no_session],   # routine errors that shouldn't page
+)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    body['user'] = None
+    body['source_ip'] = handler_util.get_source_ip(event, context)
+    body['req_ts'] = int(event['requestContext']['requestTimeEpoch']) / 1000
+
+    if (sid := handler_util.get_headers(event, context).get('session_id')):
+        body['user'] = auth_service.get_me(...)
+
+    return router(
+        body.pop('cmd'),
+        body,
+        handler_util.get_headers(event, context),
+        allowed_cmd_prefixes=['main.controller'],   # always set, never empty, never '*'
+    )
+```
+
+## AWS client access
+
+```python
+# RIGHT
+import api
+api.dynamo.put_item(...)
+api.s3_public.upload_file(...)
+
+# WRONG
+import boto3
+boto3.client('dynamodb').put_item(...)            # the linter flags this
+
+# WRONG
+from sawsi.aws.s3.api import S3API
+S3API('dev-myproject-public').upload_file(...)    # creates a fresh client per call
+```
+
+Always go through `api.py`. The linter (`sawsi_lint.py`) flags both `import boto3` and direct `*API(...)` instantiation.
+
+## Resource naming
+
+```python
+# api.py
+dynamo = LazyLoadedAPI(DynamoDBAPI, f'{env}-{project_name}', region=region)
+# NOT  LazyLoadedAPI(DynamoDBAPI, 'dev-myproject', region=region)
+```
+
+Resource names must be built from `config.env` and a single `project_name` constant. The linter flags hardcoded `'dev-...'` resource strings.
+
+## What the linter catches
+
+The agent-skills harness ships a small linter that runs on Stop:
+
+```
+[ ] Direct `import boto3` or `from boto3 import ...`
+[ ] Hardcoded resource names matching '<env>-...' strings
+[ ] DynamoModel subclass without @sync
+[ ] Handler return value with a literal `statusCode` key
+```
+
+It deliberately doesn't try to catch everything — these four catch the most common mistakes.
+
+## Anti-patterns at a glance
+
+| Pattern | Why it's wrong | Replace with |
+|---|---|---|
+| `body['cmd']` inside a controller | Bypasses signature injection | Add typed parameters |
+| `Optional[str] = None` on GSI key | DynamoDB rejects NULL on indexed attrs | `str = ' '` + `.strip()` checks |
+| `FilterExpression(...)` in query | Bills for filtered rows; limit broken | Narrow with index; filter in Python |
+| `{'statusCode': 200, 'body': ...}` returned from controller | Wrapper double-wraps | Return a plain dict |
+| `try/except AppError:` inside controller | Hides business errors from monitoring | Let it bubble |
+| `time.sleep(...)` in a hot path | Wastes Lambda billing seconds | Re-architect with SQS or Step Functions |
+| `print(...)` for production logs | Hard to filter, no structure | `print(json.dumps(...))` or Firehose |
+| `import api` at module top + `api.secret_manager.get_secret_value(...)` at top | Forces SecretsManager init at cold start | Wrap in function |
+
+## Code review checklist
+
+Use this when reviewing a sawsi PR:
+
+```
+[ ] cmd routing prefix unchanged or intentionally extended
+[ ] New models have @sync and correct _table/_indexes
+[ ] Sparse GSI fields default to ' '
+[ ] No FilterExpression in user-facing paths
+[ ] Controller params are named (not body-unpacking)
+[ ] Controllers raise AppError (don't return error dicts)
+[ ] New AWS resources are reflected in api.py
+[ ] aws_iam_policy_dev.json AND aws_iam_policy_prod.json updated together
+[ ] LAMBDAS array updated if a new function shipped
+[ ] No use_traceback=True in prod handlers
+[ ] No print() outside of structured logging
+```
+
+If your PR clears all of these, it's probably ready.
+
+## The single most common mistake
+
+Forgetting to update `aws_iam_policy_prod.json` when you updated `aws_iam_policy_dev.json`. The dev deploy passes. The prod deploy fails the first time someone hits the new endpoint, hours later. The on-call gets paged for an "AccessDeniedException" they didn't write.
+
+Make a habit: `git diff aws_iam_policy_*.json` in every PR description.

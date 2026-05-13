@@ -1,0 +1,165 @@
+---
+title: 국제화
+description: 3계층 번역 캐시 — 빌드 타임 JSON, 런타임 DynamoDB, 자동 채우는 LLM 폴백을 알려드려요.
+---
+
+다국어 앱의 경우, sawsi 프로젝트는 종종 UI 문자열, 푸시 알림, 검증 메시지를 여러 언어로 제공해야 해요. 프레임워크가 i18n 모듈을 출시하지는 않지만 — 대부분의 프로젝트가 수렴하는 프로덕션 패턴이 작아서 여기 문서화할 만해요.
+
+## 3계층 캐시
+
+패턴은 세 계층의 **read-through 캐시**예요.
+
+```
+tr(text, fyi, group, lang) 
+   │
+   ▼
+1. 로컬 JSON (람다 이미지에 번들된 locale.json)
+   │ miss
+   ▼
+2. DynamoDB Translation 테이블
+   │ miss
+   ▼
+3. LLM 호출 (Bedrock/OpenAI) → DynamoDB에 저장 → 반환
+```
+
+- **빌드 타임 JSON** — `build_keeper.py`가 생성하고, 람다 이미지에 구워져요. 이미 번역된 문자열에 대해 0 비용 조회예요.
+- **DynamoDB** — 런타임에 추가된 번역 (이미지 빌드 후). 컨테이너 재활용에서도 살아남아요.
+- **LLM 폴백** — 새 문자열이 처음 요청되면 모델에 번역을 요청하고 결과를 저장해요. 이후 읽기는 DynamoDB 계층에서 히트해요.
+
+## Translation 모델
+
+```python title="model/translation.py"
+import hashlib
+from sawsi.model.base import DynamoModel, sync
+import api
+
+@sync
+class Translation(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'translation'
+
+    text: str             # 원본 (보통 한국어)
+    fyi: str = ''         # 번역가/LLM을 위한 컨텍스트 힌트
+    group: str = 'common'
+    call_trace: str = ''  # file:line:context — stale 엔트리 찾기용
+
+    # 지원 언어당 한 칼럼
+    ko: str = ''
+    en: str = ''
+    es: str = ''
+    zh_Hans: str = ''
+    ja: str = ''
+    pt: str = ''
+
+    @staticmethod
+    def make_key(group, text):
+        return hashlib.sha256(f'{group}:{text}'.encode()).hexdigest()
+```
+
+기본 키는 `group + text`의 SHA-256이에요 — 둘 중 하나의 변경이 새 row를 만들도록 해서 캐시 충돌을 피해요.
+
+## `tr()` 함수
+
+```python title="translation.py"
+import inspect, json, os
+from main.model.translation import Translation
+import api
+
+# 빌드 타임에 이미지에 번들됨
+TR_DATA = {}
+locale_path = f'{config.env}-locale.json'
+if os.path.exists(locale_path):
+    with open(locale_path) as f:
+        for row in json.load(f):
+            TR_DATA[row['id']] = row
+
+def tr(text: str, fyi: str = '', group: str = 'common') -> Translation:
+    key = Translation.make_key(group, text)
+
+    # 1. 로컬 캐시
+    if key in TR_DATA:
+        return Translation(**TR_DATA[key])
+
+    # 2. DynamoDB
+    record = Translation.get(key)
+    if record:
+        TR_DATA[key] = record.model_dump()
+        return record
+
+    # 3. LLM 폴백
+    record = _translate_with_llm(text, fyi, group)
+    record.id = key
+    record.call_trace = _capture_trace()
+    record.put(can_overwrite=True)
+    TR_DATA[key] = record.model_dump()
+    return record
+```
+
+호출자는 올바른 언어를 골라요.
+
+```python
+phrase = tr('환영합니다', group='onboarding').en
+```
+
+## 빌드 타임 dump
+
+로케일 파일을 dump하는 `build_keeper.py` 단계예요.
+
+```python title="translation.py (계속)"
+def make_locale_json():
+    rows = []
+    for t in Translation.generate():
+        rows.append(t.model_dump())
+    with open(f'{config.env}-locale.json', 'w') as f:
+        json.dump(rows, f, ensure_ascii=False)
+```
+
+`docker build` 동안 실행되어, 배포된 람다가 hot 로컬 캐시로 시작해요.
+
+## 지원 언어
+
+언어당 `Translation`에 칼럼을 추가해요. 전형적인 라인업이에요.
+
+| 코드 | 언어 |
+|---|---|
+| `ko` | 한국어 |
+| `en` | 영어 |
+| `es` | 스페인어 |
+| `zh_Hans` | 중국어 간체 |
+| `ja` | 일본어 |
+| `pt` | 포르투갈어 |
+
+언어 추가 비용은 칼럼 하나 + 기존 문자열당 LLM 호출 하나예요 (사용자가 그 언어로 문자열을 만나는 대로 분산돼요).
+
+## 호출 사이트 캡처
+
+`inspect.stack()`이 `tr()` 호출이 어디서 발생했는지 기록할 수 있어요.
+
+```python
+def _capture_trace():
+    frame = inspect.stack()[2]
+    return f'{frame.filename}:{frame.lineno}'
+```
+
+`call_trace` 필드에 저장돼요 — 나중에 소스 코드가 삭제된 번역을 **가지치기**할 때 매우 유용해요.
+
+## `fyi` 힌트
+
+모호한 원본 문자열엔 `fyi`를 전달해 주세요.
+
+```python
+tr('주문', fyi='전자상거래의 주문, 정렬 순서가 아님', group='shop').en
+```
+
+LLM이 `fyi`를 시스템 컨텍스트로 사용해요. 없으면 "주문"은 "order"로 번역되지만 "주문하다"인지 "순서"인지 모를 수 있어요.
+
+## 이것이 *아닌* 것
+
+- UI 문자열 추출 도구가 아니에요. `tr(...)` 호출을 인라인으로 작성해요 — `extract` 단계가 없어요.
+- 번역 메모리 에디터가 아니에요. 생성된 번역이 잘못되면 DynamoDB row를 직접 편집하면 돼요 (어드민 경유).
+- 전체 ICU 복수형/성별 처리가 아니에요. "1개" vs "5개"는 Python에서 조건으로 작성해요.
+
+## 다음
+
+- [쿡북: 번역된 푸시 알림 추가](/docs/practice/cookbook) — 전체 예시예요.
+- [에러 & 결과 코드](/docs/architecture/errors) — 에러 메시지도 같은 계층으로 번역돼요.

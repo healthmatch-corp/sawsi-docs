@@ -1,0 +1,203 @@
+---
+title: Triggers
+description: API Gateway, SQS, EventBridge, WebSocket, S3, and webhook — six event sources, one routing pattern.
+---
+
+A sawsi project typically has several Lambda functions, each scaffolded with `awsi add <app> -t <trigger>`. The body of each handler does the same three things — extract from `event`, normalize into `body`, dispatch — but the event shape and the dispatch key differ.
+
+## API Gateway (`-t agw`)
+
+The default trigger. One endpoint, JSON body in, JSON body out.
+
+```python title="main/aws_handler.py"
+@handler_util.aws_handler_wrapper(
+    error_receiver=slack_notify,
+    use_traceback=False,
+    ignore_app_errors=[errs.no_session],
+)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+    source_ip = handler_util.get_source_ip(event, context)
+    req_ts = int(event['requestContext']['requestTimeEpoch']) / 1000
+
+    body['user'] = None
+    body['source_ip'] = source_ip
+    body['req_ts'] = req_ts
+
+    if (sid := headers.get('session_id')):
+        body['user'] = auth_service.get_me(session_id=sid, req_ts=req_ts)
+
+    cmd = body.pop('cmd')
+    return router(cmd, body, headers, allowed_cmd_prefixes=['main.controller'])
+```
+
+Notable:
+
+- Authentication runs **between** body normalization and `router()` so the user object is available to every controller via signature injection.
+- Some controllers must be reachable without a session (register, login, password reset). Use an inline whitelist:
+
+```python
+if cmd in NO_SESSION_CMDS or sid:
+    return router(cmd, body, headers, allowed_cmd_prefixes=['main.controller'])
+raise errs.no_session
+```
+
+## SQS (`-t sqs`)
+
+A queue worker. The event is `{'Records': [{'body': '...json...', ...}, ...]}`.
+
+```python title="queue_receiver/aws_handler.py"
+@handler_util.aws_handler_wrapper(use_traceback=True)
+def handler(event, context):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = []
+        for record in event['Records']:
+            message = json.loads(record['body'])
+            cmd = message['type']
+            body = message.get('body', {})
+            futures.append(pool.submit(_handle_one, cmd, body))
+        for f in futures:
+            f.result()   # surface exceptions for SQS retry
+    return None
+
+def _handle_one(cmd, body):
+    return router(cmd, body, {}, allowed_cmd_prefixes=['queue_receiver.controller'])
+```
+
+The convention is:
+
+- Senders put `{'type': 'queue_receiver.controller.x.y', 'body': {...}}` into SQS.
+- The worker treats `type` as the cmd and `body` as the controller arguments.
+
+Re-raising exceptions from the futures matters: if you swallow them, SQS will mark the batch as successful and never retry.
+
+## EventBridge Scheduler (`-t ebs`)
+
+Invoke this Lambda once per minute (or whatever EventBridge rule you configure). Inside, fan out to many cron-matched jobs using `ScheduledTask`.
+
+```python title="scheduler/aws_handler.py"
+from sawsi.shared.schedule_util import ScheduledTask, join
+
+def handler(event, context):
+    # Hourly at :01 — match reminder
+    with ScheduledTask('1 * * * *') as do:
+        from scheduler.controller import match
+        do(match.send_pre_match_notifications)
+
+    # Every minute — bot scheduling
+    with ScheduledTask('* * * * *') as do:
+        from scheduler.controller import bots
+        do(bots.tick)
+
+    # Friday 11:00 — weekly stats
+    with ScheduledTask('0 11 * * 5') as do:
+        from scheduler.controller import stats
+        do(stats.send_weekly_summary)
+
+    join()  # wait for all background threads
+    return None
+```
+
+How `ScheduledTask` works: on enter, it checks whether the cron expression matches *now*. If yes, `do(func)` schedules the function to run in a background thread. If no, `do` is a no-op. `join()` waits for any background threads launched during this invocation.
+
+Use the same `aws_handler_wrapper` if you want consistent logging, but a scheduler Lambda doesn't need to return an API-Gateway-shaped response.
+
+## WebSocket (`-t ws`)
+
+API Gateway WebSocket routes — `$connect`, `$disconnect`, `$default` — all funnel into one handler.
+
+```python title="websocket_receiver/aws_handler.py"
+def handler(event, context):
+    route_key = event['requestContext']['routeKey']
+    connection_id = event['requestContext']['connectionId']
+
+    if route_key == '$connect':
+        return _on_connect(event, connection_id)
+    if route_key == '$disconnect':
+        return _on_disconnect(connection_id)
+
+    body = json.loads(event['body'])
+    cmd = body.pop('cmd')
+    body['connection_id'] = connection_id
+    return router(cmd, body, {}, allowed_cmd_prefixes=['websocket_receiver.controller'])
+```
+
+To push a message back to a connected client:
+
+```python
+import api
+api.apigw.post_to_connection(data=json.dumps({...}), connection_id=connection_id)
+```
+
+`api.apigw` is the `APIGatewayManagement` wrapper. Its endpoint URL is set in `api.py` and is environment-specific (the dev WebSocket API has a different `execute-api` host than prod).
+
+## S3 trigger
+
+S3 events fire when objects are created/deleted. Dispatch by key prefix:
+
+```python title="s3trigger/aws_handler.py"
+def handler(event, context):
+    for record in event['Records']:
+        object_key = record['s3']['object']['key']
+        event_name = record['eventName']  # ObjectCreated:Put, etc.
+
+        if object_key.startswith('image/'):
+            from s3trigger.controller import image_convert
+            image_convert.convert_to_webp(object_key)
+        elif object_key.startswith('video/'):
+            from s3trigger.controller import video_convert
+            video_convert.convert_to_mp4(object_key)
+    return None
+```
+
+This trigger is the one place where `cmd` routing does not buy you much — the dispatch is driven by object keys, which are external. A simple `if/elif` chain is the convention.
+
+## Webhook receiver (`-t webhook`)
+
+For inbound HTTPS POSTs from third parties (payment providers, app stores, OAuth providers). The cmd comes from the querystring, not the body:
+
+```python title="webhook_receiver/aws_handler.py"
+@handler_util.aws_handler_wrapper(use_traceback=False)
+def handler(event, context):
+    qs = event.get('queryStringParameters') or {}
+    cmd = qs.get('cmd')
+    if not cmd:
+        raise errs.no_cmd
+
+    body = handler_util.get_body(event, context) or {}
+    body['headers'] = handler_util.get_headers(event, context)
+    body['raw_body'] = event.get('body')   # for signature verification
+
+    return router(cmd, body, {}, allowed_cmd_prefixes=['webhook_receiver.controller'])
+```
+
+Controllers under `webhook_receiver.controller.*` typically:
+
+1. Verify the request signature using `raw_body` and a secret from `api.secret_manager`.
+2. Parse the payload.
+3. Update DynamoDB and possibly trigger downstream work via SQS.
+
+## Cross-Lambda calls
+
+When one Lambda needs to enqueue work for another:
+
+| From → To | Mechanism |
+|---|---|
+| Any → SQS worker | `api.sqs.send_message(json.dumps({'type': '<cmd>', 'body': {...}}))` |
+| API Gateway → another API Gateway Lambda | `api.lambda_client.invoke(function_name, payload)` (sync) or via SQS (async) |
+| Any → WebSocket client | `api.apigw.post_to_connection(...)` |
+| Any → SNS topic | `api.sns.send_message(topic_arn, message)` |
+
+## Picking a trigger
+
+| If your code... | Use trigger |
+|---|---|
+| ...responds to user-facing HTTPS requests | `agw` |
+| ...does background work too slow for synchronous response | `sqs` |
+| ...runs on a schedule | `ebs` |
+| ...reacts to file uploads | S3 trigger |
+| ...pushes live updates to clients | `ws` |
+| ...receives callbacks from third parties | `webhook` |
+
+The full reference for each is in the [Multi-Lambda layout](/docs/architecture/multi-lambda) chapter, which covers how these triggers coexist in one project.

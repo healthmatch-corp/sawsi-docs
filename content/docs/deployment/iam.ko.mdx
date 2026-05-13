@@ -1,0 +1,243 @@
+---
+title: IAM
+description: env prefix로 스코핑된 최소 권한 정책, 서비스별 권한 템플릿, dev/prod 패리티 규칙을 알려드려요.
+---
+
+람다 실행 역할에 부착된 IAM 정책이 sawsi 프로젝트에서 단일 가장 중요한 보안 경계예요. 이 페이지는 무엇을 넣을지, 환경 간 어떻게 동기화할지에 대한 레퍼런스예요.
+
+## 구조
+
+```json title="aws_iam_policy_dev.json (스켈레톤)"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "DynamoDB",        "Effect": "Allow", "Action": ["dynamodb:*Item", "dynamodb:Query", ...], "Resource": ["arn:aws:dynamodb:*:*:table/dev-myproject*", "arn:aws:dynamodb:*:*:table/dev-myproject*/index/*"] },
+    { "Sid": "S3",              "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", ...],     "Resource": ["arn:aws:s3:::dev-myproject*", "arn:aws:s3:::dev-myproject*/*"] },
+    { "Sid": "SecretsManager",  "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],         "Resource": ["arn:aws:secretsmanager:*:*:secret:dev/myproject*"] },
+    { "Sid": "Firehose",        "Effect": "Allow", "Action": ["firehose:PutRecord", "firehose:PutRecordBatch"], "Resource": ["arn:aws:firehose:*:*:deliverystream/dev-myproject*"] },
+    { "Sid": "SES",             "Effect": "Allow", "Action": ["ses:SendEmail", "ses:SendRawEmail"],     "Resource": "*" },
+    { "Sid": "SQS",             "Effect": "Allow", "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"], "Resource": ["arn:aws:sqs:*:*:dev_myproject*"] },
+    { "Sid": "Logs",            "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": "*" },
+    { "Sid": "XRay",            "Effect": "Allow", "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords"], "Resource": "*" }
+  ]
+}
+```
+
+핵심은 이래요: 리소스를 명명하는 모든 ARN이 **env prefix로 스코핑**돼요 (`dev-myproject*`, `dev/myproject*`, `dev_myproject*`). prod는 `prod-`로 평행 파일을 가져요.
+
+## 왜 prefix로 스코프
+
+두 가지 이유가 있어요:
+
+1. **폭발 반경.** dev의 버그나 침해가 dev 테이블을 읽을 수 있지만 prod 데이터는 건드릴 수 없어요 — IAM 주체에 권한이 말 그대로 없거든요.
+2. **시끄러운 이웃 없음.** 같은 AWS 계정의 다른 프로젝트가 어떤 공유 역할을 쓰더라도 당신 테이블을 실수로 못 읽어요.
+
+Prefix는 `api.py`가 리소스에 이름 짓는 데 쓰는 것과 같아요 — 그래서 [멘탈 모델](/docs/introduction/mental-model) 챕터가 이를 "load-bearing"이라 불러요.
+
+## 서비스별 권한 세트
+
+### DynamoDB
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+    "dynamodb:Query", "dynamodb:Scan",
+    "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem",
+    "dynamodb:DescribeTable", "dynamodb:CreateTable", "dynamodb:UpdateTable", "dynamodb:UpdateTimeToLive",
+    "dynamodb:CreateGlobalSecondaryIndex", "dynamodb:UpdateGlobalSecondaryIndex"
+  ],
+  "Resource": [
+    "arn:aws:dynamodb:*:*:table/dev-myproject*",
+    "arn:aws:dynamodb:*:*:table/dev-myproject*/index/*"
+  ]
+}
+```
+
+`CreateTable`과 `*Index`는 CodeBuild 역할(`build_keeper.py` 실행)에만 필요해요. 런타임 람다 역할에서는 제거할 수 있어요 — 하지만 대부분 프로젝트는 단순함을 위해 단일 역할을 써요.
+
+### S3
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+    "s3:ListBucket", "s3:PutObjectAcl",
+    "s3:CreateBucket", "s3:PutBucketAcl"
+  ],
+  "Resource": [
+    "arn:aws:s3:::dev-myproject*",
+    "arn:aws:s3:::dev-myproject*/*"
+  ]
+}
+```
+
+`CreateBucket`과 `PutBucketAcl`은 다시 CodeBuild 한정이에요 (`init_s3_bucket()`용). 런타임에서는 제거해 주세요.
+
+비순응 이름의 버킷이 있다면 (예: 기존 레거시 버킷), 별도 statement를 추가해 주세요. `s3:::*`로 넓혀서 env-prefix 규율을 깨면 안 돼요.
+
+### Secrets Manager
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["secretsmanager:GetSecretValue"],
+  "Resource": ["arn:aws:secretsmanager:*:*:secret:dev/myproject*"]
+}
+```
+
+Secrets Manager는 경로 구분자가 `-`가 아니라 `/`임에 주의해 주세요. `api.py`가 정확히 이 이유로 `f'{env}/{project}'`를 써요.
+
+### Firehose
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["firehose:PutRecord", "firehose:PutRecordBatch"],
+  "Resource": ["arn:aws:firehose:*:*:deliverystream/dev-myproject*"]
+}
+```
+
+CodeBuild에는(firehose_log.init() 실행) `firehose:CreateDeliveryStream`, `iam:PassRole`, 그리고 스트림이 쓰는 역할을 만들 IAM 권한을 추가해 주세요. 가능하면 CodeBuild 전용 정책에 보관해 주세요 — 런타임 람다엔 필요 없어요.
+
+### SES / SMS / SNS
+
+```json
+{
+  "Sid": "SES",
+  "Effect": "Allow",
+  "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+  "Resource": "*"
+},
+{
+  "Sid": "SNS",
+  "Effect": "Allow",
+  "Action": ["sns:Publish"],
+  "Resource": "*"
+}
+```
+
+유용한 리소스 ARN 스코핑이 없어요 — 검증은 identity 레벨(SES) 또는 계정 레벨(SNS 전화 캡)에서 해요.
+
+### SQS
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"],
+  "Resource": ["arn:aws:sqs:*:*:dev_myproject*"]
+}
+```
+
+큐 ARN은 일부 sawsi 프로젝트에서 `-` 대신 `_`를 써요 — 실제 큐가 쓰는 것에 맞춰 주세요. 어느 쪽이든 prefix는 env 스코프예요.
+
+### Lambda 클라이언트 (크로스 람다 호출용)
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["lambda:InvokeFunction"],
+  "Resource": ["arn:aws:lambda:*:*:function:dev_myproject_*"]
+}
+```
+
+어떤 람다가 `api.lambda_client.invoke()`로 다른 람다를 호출하는 경우에만 필요해요. 팬아웃에 SQS만 쓴다면 제거할 수 있어요.
+
+### CloudWatch Logs
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+  "Resource": "*"
+}
+```
+
+람다 실행 역할은 보통 기본으로 가져요. 커스텀 역할에서 시작하면 명시적으로 추가해 주세요.
+
+### X-Ray (옵션)
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords"],
+  "Resource": "*"
+}
+```
+
+### API Gateway Management (WebSocket 푸시)
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["execute-api:ManageConnections"],
+  "Resource": ["arn:aws:execute-api:*:*:<ws-api-id>/*"]
+}
+```
+
+`<ws-api-id>`를 당신 WebSocket API id로 교체해 주세요. prefix 매칭이 깔끔하지 않은 몇 안 되는 리소스 중 하나예요.
+
+### Bedrock
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["bedrock:InvokeModel", "bedrock:Converse"],
+  "Resource": [
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-*",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6-*",
+    "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:*"
+  ]
+}
+```
+
+호출할 모델만 정확히 나열해 주세요. 새 모델 도입 시 정책을 갱신해 주세요.
+
+## dev/prod 패리티 규칙
+
+**`aws_iam_policy_dev.json`을 편집할 때마다 같은 커밋에서 `aws_iam_policy_prod.json`도 편집해 주세요.**
+
+sawsi 프로젝트에서 가장 흔한 배포 사건이 "dev 기능 후 첫 prod 배포가 AccessDenied로 실패"예요 — 누군가 dev 정책을 갱신하고 prod를 잊었기 때문이에요. 두 가지 안전장치가 있어요:
+
+1. **코드 리뷰에서 파일 diff.** 구조적으로 동일해야 하며, `dev-` / `dev_` / `dev/`만 `prod-` / `prod_` / `prod/`로 교체된 형태여야 해요.
+2. **둘을 생성하는 단일 스크립트 사용.** 일부 팀이 `aws_iam_policy.template.json`을 두고 `sed`로 두 출력을 렌더해요. 두 번 사건을 겪으면 할 만한 가치가 있어요.
+
+## 함수별 역할
+
+매우 보안 민감한 구성에서는 각 람다에 필요한 권한만 가진 자체 역할을 부여해 주세요:
+
+- `main_role`: DynamoDB read+write, public 버킷 S3 read+write, Secrets, Firehose, SQS:SendMessage.
+- `admin_role`: `main_role` 상위 집합 + 어드민 도구용 더 넓은 DynamoDB 쓰기.
+- `worker_role`: DynamoDB read+write, SQS:Receive+Delete, SES 없음, public S3 없음.
+
+대부분 프로젝트는 공유 역할로 시작하고 감사가 요구할 때만 분리해요.
+
+## CodeBuild 역할 vs 람다 실행 역할
+
+이 둘은 **다른 두 역할**이에요:
+
+| 역할 | 하는 일 |
+|---|---|
+| CodeBuild 서비스 역할 | 이미지 빌드, ECR 푸시, `aws lambda update-function-*` 실행. `lambda:UpdateFunction*`과 올바른 repo에 대한 `ecr:*`을 포함한 넓은 인프라 권한 필요. |
+| 람다 실행 역할 | 런타임에 람다가 가지는 역할. 애플리케이션이 실제 읽고 쓰는 것만 필요. |
+
+이 둘을 혼동하지 말아 주세요. CodeBuild 역할은 넓을 수 있어요(CI에서 실행되고 사용자 트래픽이 아니니까요). 람다 실행 역할은 타이트해야 해요.
+
+## 정책 감사
+
+정책 diff 검토 시 빠른 체크리스트예요:
+
+```
+[ ] 모든 리소스 ARN이 env prefix 포함 (리소스에 노출 와일드카드 없음)
+[ ] dev와 prod 파일이 env prefix에서만 다름
+[ ] 이 PR에서 사용한 새 AWS 서비스가 정책에 반영됨
+[ ] 액션이 필요한 것보다 넓지 않음 (`s3:*`은 드묾; 보통 특정 verb)
+[ ] 주체 측 "Allow *" 없음 (액션이 요구하지 않는 한 Resource: "*" 부여 금지)
+```
+
+## 이것이 *아닌* 것
+
+- 일반적인 AWS IAM 튜토리얼이 아니에요. 최소 권한 설계에 대한 AWS 리소스는 많아요 — 이 페이지는 sawsi가 구체적으로 필요한 것을 다뤄요.
+- 시도를 대체하지 않아요. dev에 배포하고 CloudWatch에서 AccessDenied를 보고 반복해 주세요.

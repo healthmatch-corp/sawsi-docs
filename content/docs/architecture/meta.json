@@ -1,0 +1,4 @@
+{
+  "title": "Architecture",
+  "pages": ["multi-lambda", "i18n", "errors", "observability"]
+}

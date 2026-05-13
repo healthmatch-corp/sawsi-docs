@@ -1,13 +1,68 @@
 ---
-title: Hello World
-description: Your first document
+title: Welcome
+description: The official handbook for sawsi — a Python framework for AWS Lambda backends.
 ---
 
-Welcome to the docs! You can start writing documents in `/content/docs`.
+**sawsi** (simple-aws-interface) is a Python framework for shipping AWS Lambda backends without re-inventing the boring parts. It bundles a `cmd`-based router, a Pydantic-backed DynamoDB ORM, lazy-loaded AWS service wrappers, and an opinionated deploy flow into a single coherent stack.
 
-## What is Next?
+This handbook covers the framework from first principles down to deployment-day checklists. It is split into four arcs:
 
 <Cards>
-  <Card title="Learn more about Next.js" href="https://nextjs.org/docs" />
-  <Card title="Learn more about Fumadocs" href="https://fumadocs.dev" />
+  <Card title="Foundations" href="/docs/introduction/about">
+    What sawsi is, why it exists, and the mental model you carry across every page that follows.
+  </Card>
+  <Card title="Building blocks" href="/docs/handlers/request-lifecycle">
+    Handlers, routing, DynamoModel, authentication, and the AWS service wrappers that sit behind `api.py`.
+  </Card>
+  <Card title="Architecture" href="/docs/architecture/multi-lambda">
+    Multi-Lambda layout, error model, observability, and the deployment pipeline.
+  </Card>
+  <Card title="Practice" href="/docs/practice/cookbook">
+    Conventions, anti-patterns, cookbook recipes, and a full API reference.
+  </Card>
 </Cards>
+
+## Who this is for
+
+You are building a serverless backend on AWS, in Python, and you want:
+
+- A flat **`cmd` → controller** API surface instead of REST path matching.
+- A DynamoDB ORM that treats GSIs and sparse indexes as first-class.
+- A way to share a single AWS resource pool (`api.py`) across many Lambda triggers — API Gateway, SQS, EventBridge, S3, WebSocket, and webhook receivers — without duplication.
+- Container-image deploys that initialize tables/buckets/indexes idempotently on every release.
+
+If that is the shape of your project, this is the manual.
+
+## A 30-second tour
+
+```python title="main/aws_handler.py"
+@aws_handler_wrapper(use_traceback=False, error_receiver=slack_notify)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    body['source_ip'] = handler_util.get_source_ip(event, context)
+    body['user'] = _resolve_user(body)
+    cmd = body.pop('cmd')
+    return router(cmd, body, {}, allowed_cmd_prefixes=['main.controller'])
+```
+
+```python title="main/controller/user.py"
+@controller
+def get_profile(user, **kwargs):
+    if user is None:
+        raise errs.no_session
+    return {'name': user.name, 'birth': user.birth}
+```
+
+```python title="main/model/user.py"
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [('phone', None), ('google_social_id', None)]
+
+    name: str
+    phone: str = ' '              # sparse GSI: blank instead of None
+    google_social_id: str = ' '
+```
+
+Each of these snippets is unpacked end-to-end in the chapters that follow. The next stop is [What is sawsi](/docs/introduction/about).

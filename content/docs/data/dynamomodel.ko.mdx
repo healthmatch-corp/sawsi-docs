@@ -1,0 +1,261 @@
+---
+title: DynamoModel
+description: 자동 필드, GSI 선언, sparse 인덱스를 지원하는 Pydantic 타입 DynamoDB ORM이에요.
+---
+
+`DynamoModel`은 sawsi의 데이터 계층이에요. Python 클래스를 DynamoDB 테이블로 바꿔 주는 얇은 Pydantic v2 베이스 클래스인데, 자동 PK, SK, 그리고 "모든 행" 내장 인덱스까지 포함하고 있어요.
+
+## 완전한 모델
+
+```python title="main/model/user.py"
+from typing import Optional
+from sawsi.model.base import DynamoModel, sync
+import api
+
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [
+        ('phone', None),
+        ('google_social_id', None),
+        ('apple_social_id', None),
+        ('u_b', 'geohash'),
+    ]
+
+    name: str
+    birth: str
+    phone: str = ' '
+    email: Optional[str] = None
+
+    google_social_id: str = ' '
+    apple_social_id: str = ' '
+
+    lat: float = 0
+    lng: float = 0
+    geohash: str = ' '
+
+    following_count: int = 0
+    is_official: bool = False
+```
+
+이 스니펫에서 짚어 둘 게 여섯 가지 있어요.
+
+## 1. `@sync` 데코레이터
+
+`@sync`가 클래스를 모듈 레벨 리스트 `__models_to_sync__`에 등록해 줘요. 배포할 때 `build_keeper.py`가 `sync_all_models(['main.model'])`을 호출하면 이렇게 동작해요.
+
+1. `main.model` 하위의 모든 모듈을 import해요 (그러면 `@sync` 호출이 일어나요).
+2. `__models_to_sync__`를 순회하면서 24 병렬 스레드로 각각 `cls.sync_table()`을 호출해요.
+
+`sync_table()`은 테이블이 없으면 새로 만들고, `_indexes`에 선언된 새 GSI를 추가해 줘요. 멱등하게 동작해요.
+
+<Callout type="warn">
+`@sync`를 잊으면 모델이 Python에는 있지만 **DynamoDB에는 없는** 상태가 돼요. 이걸 처음 사용하는 호출이 프로덕션에서 `ResourceNotFoundException`을 일으켜요. 입문자가 가장 자주 하는 실수예요.
+</Callout>
+
+## 2. `__dynamo__` — 어느 DynamoDB를 쓸지
+
+모든 sawsi 모델은 `api.py`의 싱글턴을 가리켜요.
+
+```python
+__dynamo__ = api.dynamo
+```
+
+`api.dynamo`는 `DynamoDBAPI(group_name=f'{env}-{project}')`이에요. `group_name`은 **prefix**여서, 실제 테이블 이름은 `{env}-{project}_{_table}` 형태가 돼요. 그래서 이 `User` 클래스는 이렇게 만들어져요.
+
+| env | 테이블 이름 |
+|---|---|
+| dev | `dev-myproject_user` |
+| prod | `prod-myproject_user` |
+
+같은 Python 코드가 환경별로 다른 DynamoDB 테이블을 만들어요 — 전적으로 `config.env`가 결정해요.
+
+## 3. 작성하지 않는 자동 필드
+
+모든 `DynamoModel`은 이미 이런 필드를 가지고 있어요.
+
+```python
+id: str  = uuid.uuid4()      # 파티션 키
+crt: float = time.time()      # 정렬 키 (생성 타임스탬프)
+u_b: str = '_'                # "universal bucket", 항상 '_'
+```
+
+| 필드 | 역할 |
+|---|---|
+| `id` | 기본 파티션 키예요. UUID4 문자열로, 생성할 때 자동으로 부여돼요. |
+| `crt` | 기본 정렬 키예요. Float UNIX 타임스탬프로, 생성할 때 자동으로 부여돼요. |
+| `u_b` | 무료 내장 GSI의 파티션 키예요 — "모든 행을 `crt` 순서로" 조회할 수 있어요. 항상 `'_'`이에요. |
+
+서브클래스에서 이 필드들을 **재정의하지 마세요**. 프레임워크가 기본값과 `u_b`가 상수라는 점에 의존하고 있어요.
+
+## 4. `_indexes` — GSI 선언
+
+`_indexes`는 `(파티션_키_필드, 정렬_키_필드)` 튜플 리스트예요. 각 튜플이 Global Secondary Index가 돼요.
+
+```python
+_indexes = [
+    ('phone', None),              # phone만 있는 GSI
+    ('u_b', 'geohash'),           # geohash로 정렬되는 두 번째 "모든 행" 인덱스
+    ('creator_id', 'crt'),        # 사용자별 생성 이벤트를 시간순으로
+]
+```
+
+`__create_default_index__ = False`로 opt-out하지 않는 이상, 프레임워크가 `(u_b, crt)` 인덱스도 자동으로 만들어 줘요. 그래서 인자 없이 호출한 `User.query()`가 무료로 모든 사용자를 시간순으로 돌려줘요.
+
+## 5. Sparse GSI 필드 — `' '` 패턴
+
+DynamoDB는 `NULL`을 인덱싱할 수 없어요. 가끔 비어 있는 필드 — 예를 들어 이메일로 가입한 사용자의 `google_social_id` 같은 필드 — 를 `Optional[str] = None`으로 표시하면 안 돼요. Pydantic이 `None`을 dump하고, boto3가 그걸 `NULL` 속성으로 번역하기 때문이에요. 다음 put에서 `ValidationException`이 나요.
+
+컨벤션은 **한 칸 공백**으로 기본값을 두는 거예요.
+
+```python
+google_social_id: str = ' '   # 한 칸, ''가 아니고 None도 아니에요
+```
+
+빈 문자열이 아니라 왜 공백일까요? 일부 boto3 경로는 여전히 `''`를 누락으로 취급해서 필드가 row에서 통째로 사라져요. `' '`는 직렬화에서 살아남고 GSI를 *진짜* sparse 인덱스로 유지해 줘요 (기본값을 가진 row는 여전히 `' '` 키로 인덱싱되지만, 그 값으로 조회를 안 할 뿐이에요).
+
+필드가 "실제로 설정됐는지" 확인할 때는 `.strip()`을 써요.
+
+```python
+if user.google_social_id.strip():
+    ...   # 실제 값이 있어요
+```
+
+이 패턴은 부재 가능한 모든 GSI 키 필드에 적용돼요 — `phone`, `email`, `invite_code`, `anon_nickname` 같은 것들이요.
+
+## 6. CRUD 동작
+
+```python
+# 생성
+user = User(name='Kim', birth='1990-01-01')
+user.put()                       # 중복 id면 raise
+user.put(can_overwrite=True)     # 기존을 덮어쓰기
+
+# 읽기
+user = User.get('user-uuid')                                # → User | None
+users = User.batch_get(['id1', 'id2', 'id3'])               # 병렬, 최대 32 스레드
+
+# 갱신 — 변경된 필드만 써요
+user.name = 'Lee'
+user.update()                                                 # name만 써요
+
+# 삭제
+user.delete()
+```
+
+### `.update()` no-op 함정
+
+`update()`는 `__setattr__`로 속성 변경을 추적해서 `__modified_attributes__`의 필드만 보내요. 모델을 로드하고 아무것도 바꾸지 않은 채 `update()`를 호출하면 **0회** 쓰기가 일어나요 — 조용한 no-op예요.
+
+```python
+user = User.get('user-uuid')
+# user를 실제로 변경하는 걸 잊었어요
+user.update()                  # DynamoDB 호출 없이 user 그대로 반환해요
+```
+
+프레임워크 기본값을 가진 필드를 강제로 쓰고 싶다면 (보통 스키마에 새 필드를 추가하고 백필할 때) 이렇게 쓰세요.
+
+```python
+user.update(force_update_default_fields=True)
+```
+
+기본값을 가진 모든 필드를, 변경 여부와 무관하게 쓰기 집합에 추가해 줘요.
+
+## 쿼리
+
+```python
+# 기본 "u_b" 인덱스 쿼리 — crt 순 모든 행
+users, end_key = User.query(limit=20)
+
+# 특정 GSI 쿼리
+users, end_key = User.query(pk_field='phone', pk_value='+82-10-1234-5678')
+
+# sort-key 조건과 함께
+users, end_key = User.query(
+    pk_field='u_b', pk_value='_',
+    sk_condition='gte', sk_value=1701432000.0,   # 이 타임스탬프 이후 생성된 row만
+    limit=50,
+)
+
+# 페이지네이션
+users, end_key = User.query(limit=20, start_key=previous_end_key)
+```
+
+`sk_condition`은 `eq`, `lte`, `lt`, `gte`, `gt`, `btw`(between, `sk_second_value` 필요), `stw`(starts with, 문자열용) 중 하나예요.
+
+### 암묵적 sort key
+
+`pk_field='u_b'`이고 `sk_field`를 생략하면, sawsi가 자동으로 `sk_field='crt'`(기본 인덱스)를 써요. 그래서 단순 호출 `User.query(limit=20)`이 설정 없이도 시간순 결과를 돌려주는 거예요.
+
+### 제너레이터로 반환
+
+```python
+for user in User.generate(pk_field='u_b', pk_value='_'):
+    process(user)
+```
+
+`generate()`는 `query()`와 동일한 시그니처지만 아이템을 하나씩 yield해요. 수천 row를 소비해야 하는데 전체를 메모리에 두고 싶지 않을 때 쓰세요.
+
+### Scan — 최후의 수단
+
+```python
+all_users = User.scan(limit=1000)
+```
+
+`scan()`은 모든 파티션을 읽어요. 프로덕션 트래픽 경로에서는 피해 주세요. 일회성 작업과 마이그레이션을 위한 거예요.
+
+## `FilterExpression`은요?
+
+`DynamoModel` 쿼리 API는 기술적으로 DynamoDB가 서버 사이드에서 적용하는 `filter_expression=Exp(...)` 인자를 지원해요. **쓰지 마세요.** 이유와 권장 패턴은 다음 챕터 [필터링 원칙](/docs/data/filtering)에서 다뤄요.
+
+## 페이지네이션 계약
+
+모든 query가 `(items, end_key)`를 돌려줘요.
+
+```python
+items, end_key = User.query(limit=20)
+if end_key is None:
+    # 마지막 페이지예요
+else:
+    next_page, end_key = User.query(limit=20, start_key=end_key)
+```
+
+클라이언트에는 `end_key`를 커서로 돌려주세요.
+
+```python
+@controller
+def list_users(start_key: dict | None = None, **kwargs):
+    items, end_key = User.query(limit=20, start_key=start_key)
+    return {
+        'items': [u.model_dump() for u in items],
+        'cursor': end_key,    # 클라이언트가 다음에 start_key로 다시 보내요
+    }
+```
+
+## 타입 → DynamoDB 변환
+
+프레임워크가 Python 타입을 예상대로 DynamoDB 속성 타입에 매핑해 줘요.
+
+| Python 타입 | DynamoDB |
+|---|---|
+| `str` | `S` |
+| `int`, `float` | `N` |
+| `bytes` | `B` |
+| `bool` | `BOOL` |
+| `list[...]`, `dict[...]` | `L`, `M` |
+| `Optional[str]` (즉 `str | None`) | `S` (None → NULL) — **GSI 키엔 쓰지 마세요** |
+| `Literal['a', 'b']` | `S` |
+
+Pydantic이 검증을 하고, `dict_util.convert_number_to_decimal` / `convert_decimal_to_number`가 Python `float`와 DynamoDB `Decimal` 사이를 왕복해 줘요.
+
+## 다음
+
+<Cards>
+  <Card title="필터링 원칙" href="/docs/data/filtering">
+    FilterExpression이 왜 금지인지, 대신 무엇을 하면 좋을지 알려 드려요.
+  </Card>
+  <Card title="마이그레이션 레시피" href="/docs/practice/migration">
+    GSI 추가, 필드 이름 변경, None → ' ' 마이그레이션을 다뤄요.
+  </Card>
+</Cards>

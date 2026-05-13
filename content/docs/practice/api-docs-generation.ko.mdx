@@ -1,0 +1,183 @@
+---
+title: API 문서 생성
+description: DocMaker — 실제 엔드포인트에서 OpenAPI를 만드는 테스트-as-문서 패턴을 알려드려요.
+---
+
+sawsi는 `sawsi.api_doc.DocMaker`를 출시해요 — **실제 API 호출을 구조화된 문서로 기록**하는 작은 도구예요. 모든 엔드포인트를 실행하는 같은 스크립트가 Swagger/OpenAPI로 제공할 수 있는 JSON 파일을 — 실제 예시 응답과 함께 — 만들어 줘요.
+
+## 아이디어
+
+대부분의 API 문서 도구는 별도 스펙 파일 작성을 요구해요. sawsi는 이를 뒤집어요 — 각 엔드포인트를 호출하는 스크립트를 작성하면, 그 기록이 문서가 돼요. 스크립트가 그린이면 정의상 문서가 정확하고, 요청 모양이 바뀌면 문서 생성 스크립트가 잡아 줘요.
+
+## 최소 `doc_maker.py`
+
+```python title="main/doc_maker.py"
+from sawsi.api_doc.doc_generator import DocMaker
+from main.aws_handler import handler
+
+doc = DocMaker(
+    entry_function=handler,
+    base_url='https://<your-api-gw>.execute-api.ap-northeast-2.amazonaws.com/default/dev_myproject_main_docker',
+    test_function=None,
+)
+
+# 옵션: 공유 헤더
+doc.add_header('session_id', 'string', '', '사용자 세션 토큰', required=False)
+doc.add_header('Content-Type', 'string', 'application/json', '', required=True)
+
+def make_api_doc():
+    doc.start_test()
+
+    # 테스트 사용자 등록 (이후 호출에 사용할 세션 확보)
+    res = doc.req(
+        api_name='register',
+        api_description='새 사용자 등록',
+        body={
+            'cmd': 'main.controller.member.register',
+            'phone': '01099990000',
+            'auth_token': 'TEST',
+            'password': 'pw',
+            'name': 'Doc Tester',
+            'birth': '1990-01-01',
+        },
+        headers={},
+        api_tags=['auth'],
+    )
+    session_id = res['session_id']
+
+    # 그들의 프로필 가져오기
+    doc.req(
+        api_name='get_profile',
+        api_description='인증된 사용자 프로필 조회',
+        body={'cmd': 'main.controller.user.get_profile'},
+        headers={'session_id': session_id},
+        api_tags=['user'],
+    )
+
+    # ... 문서화하고 싶은 다른 모든 엔드포인트 호출
+
+    # OpenAPI JSON 쓰기
+    with open('main_api.json', 'w') as f:
+        json.dump([asdict(a) for a in doc.api_list], f, indent=2, ensure_ascii=False)
+```
+
+각 `doc.req(...)` 호출은 이렇게 동작해요.
+
+1. API Gateway가 보낼 모양과 일치하는 event dict를 구성해요.
+2. `handler(event, {})`를 호출해요 — **실제** 람다 코드 경로예요.
+3. `(api_name, body, headers, response)`를 `doc.api_list`에 기록해요.
+
+스크립트 실행 후 `main_api.json`은 예시 페이로드와 응답이 있는 모든 엔드포인트를 설명하는 JSON 배열이에요.
+
+## 실행
+
+`make_api_doc()`를 `build_keeper.py`에 연결해요.
+
+```python title="build_keeper.py"
+def run():
+    config.build = True
+    sync_all_models(['main.model'])
+    api.locking.init_table()
+    api.firehose_log.init()
+    api.s3_public.init_s3_bucket(acl='public-read')
+
+    if config.env == 'dev':
+        import main.doc_maker
+        main.doc_maker.make_api_doc()
+```
+
+`if config.env == 'dev'` 가드가 prod 빌드가 prod 데이터에 대해 문서(와 더미 사용자)를 생성하는 것을 방지해 줘요.
+
+## 문서 서빙
+
+`main_api.json` 생성 후 몇 가지 옵션이 있어요.
+
+1. **S3에 업로드하고 정적 버킷에서 Swagger UI 서빙**.
+2. 어드민 포털에서 **Redoc 또는 Stoplight Elements로 렌더**.
+3. 오프라인 읽기를 위해 `docs/` 폴더에 **커밋**.
+
+S3 접근이 가장 깔끔해요.
+
+```python title="build_keeper.py (계속)"
+if config.env == 'dev':
+    main.doc_maker.make_api_doc()
+    # QA 팀이 브라우징하도록 public 버킷에 업로드
+    api.s3_public.upload_file('main_api.json', 'api-docs/main_api.json', content_type='application/json')
+```
+
+## 람다별 doc_maker
+
+문서화하려는 각 람다가 자체 `doc_maker.py`를 가져요.
+
+| 파일 | 문서화 대상 |
+|---|---|
+| `main/doc_maker.py` | 사용자 대면 API |
+| `admin/doc_maker.py` | 어드민 API |
+| `land/doc_maker.py` | 공개/랜딩 페이지 API |
+| `webhook_receiver/doc_maker.py` | 인바운드 웹훅 엔드포인트 (드물어요) |
+| `websocket_receiver/doc_maker.py` | WebSocket 메시지 타입 (드물어요) |
+
+SQS/스케줄러/s3trigger 람다는 보통 문서를 안 받아요 — 그들의 "API 표면"은 내부거든요.
+
+## 더미 데이터 설정
+
+좋은 `doc_maker.py`는 **멱등**하고 **더미 사용자**에 대해 작동해서 실데이터 오염 없이 매 배포에 실행할 수 있어요. 컨벤션이에요.
+
+```python
+def _get_or_create_test_user():
+    user = User.get_user_by_phone('01099990000')
+    if user:
+        return user
+    user = User(name='Doc Tester', phone='01099990000', birth='1990-01-01')
+    user.put()
+    return user
+```
+
+첫 배포가 테스트 사용자를 만들고, 이후 배포가 재사용해요.
+
+파괴적 엔드포인트(계정 삭제 등)엔 매 실행마다 재생성되는 별도 테스트 사용자를 사용하세요.
+
+## 태깅과 그룹핑
+
+`api_tags`가 렌더된 UI에서 엔드포인트를 그룹화해 줘요.
+
+```python
+doc.req(api_tags=['auth'], ...)
+doc.req(api_tags=['user', 'profile'], ...)
+doc.req(api_tags=['event', 'discovery'], ...)
+```
+
+렌더러는 보통 태그를 사이드바 섹션으로 표시해요.
+
+## Mock 응답
+
+엔드포인트를 실제로 실행하고 싶지 않을 때(예: 루프 안의 서드파티 API), `run_func=False, mock_response={...}`를 전달하세요.
+
+```python
+doc.req(
+    api_name='external_search',
+    body={'cmd': 'main.controller.search.external'},
+    run_func=False,
+    mock_response={'rslt_cd': 'A00000', 'results': [...]},
+)
+```
+
+문서가 mock 응답으로 기록돼요. 아껴 사용하세요 — 모든 mock이 문서가 현실과 어긋날 수 있는 자리예요.
+
+## 한계
+
+`DocMaker`는 인간 또는 내부 도구 소비를 위한 안정 API에 좋아요. 다음엔 덜 이상적이에요.
+
+- 타입 클라이언트 생성기가 소비할 **요청/응답 스키마**가 필요할 때 (`$ref` 등이 있는 OpenAPI 3.x 스키마). 출력은 스키마보다 기록에 가까워요.
+- 배포에 걸친 API 문서의 **버전 관리**가 필요할 때. 출력은 스냅샷이에요 — 이력을 원하면 소스에 핀하세요.
+- **인증 예시**가 자체 완결돼야 할 때. "register → 세션 사용" 패턴은 작동하지만 모든 엔드포인트에 대해 verbose해요.
+
+이런 경우엔 Pydantic 기반 스키마 export를 위에 쌓거나 수동 OpenAPI 스펙으로 이동하세요.
+
+## 무료로 주는 것
+
+- 매 배포에서 엔드포인트가 엔드 투 엔드로 작동한다는 자동 증명이에요.
+- 모든 엔드포인트와 현재 응답 모양에 대한 사람이 읽기 좋은 설명이에요.
+- QA와 프런트엔드 팀이 의존할 수 있는 아티팩트예요.
+
+마지막이 진짜 승리예요 — API 문서를 정확하게 유지하는 건 대부분 *거짓말을 진실보다 어렵게* 만드는 문제예요. 이 패턴이 문서와 테스트를 같은 것으로 만들어 줘요.

@@ -1,0 +1,55 @@
+{
+  "home": {
+    "badge": "Production framework",
+    "title": "AWS Lambda backends, with conventions baked in.",
+    "subtitle": "sawsi is a Python framework for serverless backends on AWS — `cmd`-based routing, a DynamoDB ORM, lazy-loaded service wrappers, and a deployment story that scales from one Lambda to a fleet.",
+    "ctaPrimary": "Read the docs",
+    "ctaSecondary": "View on GitHub",
+    "featuresTitle": "What's in the box",
+    "features": {
+      "handlers": {
+        "title": "Handlers & Routing",
+        "desc": "@aws_handler_wrapper auto-formats responses; router() dispatches to @controller functions via signature-based injection."
+      },
+      "dynamo": {
+        "title": "DynamoModel ORM",
+        "desc": "Pydantic-typed models with auto fields (id, crt, u_b), GSI declaration, sparse-index support, and per-attribute update tracking."
+      },
+      "services": {
+        "title": "AWS Service Wrappers",
+        "desc": "S3, SQS, SES, SMS, Locking, Firehose, SecretsManager, Bedrock, OpenSearch, Vector KB — all behind a uniform api.py singleton."
+      },
+      "triggers": {
+        "title": "Multi-trigger Lambdas",
+        "desc": "awsi add -t {agw|sqs|ebs|ws|webhook} scaffolds API Gateway, SQS, EventBridge, WebSocket, or webhook receivers."
+      },
+      "deploy": {
+        "title": "Container-image deploys",
+        "desc": "Dockerfile + buildspec-{env}.yml drives CodeBuild → ECR → Lambda update; build_keeper.py initializes DynamoDB tables and indexes idempotently."
+      },
+      "conventions": {
+        "title": "Conventions over config",
+        "desc": "{env}-{project} resource naming, allowed_cmd_prefixes security gate, A/B/U response codes — the framework opinions the boring decisions."
+      }
+    },
+    "exploreTitle": "Where to start",
+    "explore": {
+      "newcomer": {
+        "title": "New to sawsi",
+        "desc": "Start with the 5-minute tour, then walk the mental model."
+      },
+      "building": {
+        "title": "Building features",
+        "desc": "Cookbook recipes for OAuth, SQS workers, schedulers, and more."
+      },
+      "deploying": {
+        "title": "Shipping to AWS",
+        "desc": "Container image deploy, IAM env scoping, and cold-start tuning."
+      }
+    }
+  },
+  "nav": {
+    "docs": "Docs",
+    "reference": "Reference"
+  }
+}

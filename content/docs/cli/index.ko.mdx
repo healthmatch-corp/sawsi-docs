@@ -1,0 +1,119 @@
+---
+title: awsi CLI
+description: awsi init과 awsi add로 새 프로젝트와 새 람다 트리거를 스캐폴딩해요.
+---
+
+`pip install sawsi`를 하면 `awsi` 명령이 PATH에 등록돼요. 이 명령은 정확히 두 가지만 해요 — 새 프로젝트 스캐폴딩과 기존 프로젝트에 새 람다 트리거 추가 — 프레임워크의 나머지는 그 명령들이 만들어내는 코드일 뿐이에요.
+
+## `awsi init <project> <app>`
+
+```bash
+awsi init myproject main
+```
+
+**현재 디렉터리**에 다음을 채워요:
+
+| 파일 | 역할 |
+|---|---|
+| `api.py` | AWS 서비스 클라이언트 싱글턴 풀 |
+| `config.py` | 환경변수에서 `env` 읽기, region·`build` 플래그 |
+| `errs.py` | 앱 고유 `AppError` 인스턴스들 |
+| `build_keeper.py` | 배포 시 실행되는 리소스 init 스크립트 |
+| `requirements.txt` | Python 의존성 (sawsi 핀, 나머지는 빔) |
+| `Dockerfile` | Lambda 컨테이너 이미지 |
+| `buildspec-lambda-{dev,prod}.yml` | zip 기반 배포용 CodeBuild spec |
+| `buildspec-docker-{dev,prod}.yml` | 컨테이너 이미지 기반 배포용 CodeBuild spec |
+| `aws_iam_policy_{dev,prod}.json` | env prefix로 스코핑된 IAM 정책 템플릿 |
+| `<app>/` | 첫 번째 람다 앱 — `aws_handler.py`, `controller/`, `service/`, `model/` |
+
+내부적으로 CLI는 설치된 패키지 안의 `sawsi_boilerplate/` 디렉터리에서 파일을 복사하고 문자열 치환을 해요 — `{{project}}`는 프로젝트명(IAM ARN, 시크릿 경로 등에 쓰여요)으로, `{{app}}`은 앱명(핸들러 import, cmd prefix 등에 쓰여요)으로 바뀌어요.
+
+<Callout>
+CLI는 기존 파일을 **덮어쓰지 않아요**. 이미 채워진 디렉터리에서 `awsi init`을 실행하면 누락된 파일만 새로 만들어 줘요. 보일러플레이트 파일을 실수로 지웠다면 재실행으로 복구할 수 있어서 안전해요.
+</Callout>
+
+## `awsi add <app> -t <trigger>`
+
+```bash
+awsi add queue_receiver -t sqs
+```
+
+기존 프로젝트에 새 람다 앱 디렉터리를 추가해요. `-t` 플래그가 핸들러 스켈레톤을 골라 줘요.
+
+| 트리거 | 플래그 | 이벤트 소스 |
+|---|---|---|
+| API Gateway REST | `-t agw` (기본) | HTTP 요청, `body['cmd']`로 라우팅 |
+| SQS | `-t sqs` | 큐 메시지, `body['type']`로 라우팅 |
+| EventBridge Scheduler | `-t ebs` | 주기 호출 (보통 1분 간격), cron 매칭 `ScheduledTask` 블록 실행 |
+| WebSocket | `-t ws` | API Gateway WebSocket의 `$connect`/`$disconnect`/`$default` |
+| 웹훅 수신기 | `-t webhook` | 인바운드 HTTPS POST, 쿼리스트링 `cmd`로 라우팅 |
+
+생성되는 각 `aws_handler.py`는 이벤트 소스에 맞게 모양이 다르지만, **내부 패턴**은 동일해요 — `event`에서 관련 필드를 추출한 다음 `router(cmd, body, headers, allowed_cmd_prefixes=['<app>.controller'])`를 호출해요 (스케줄러는 일련의 `ScheduledTask(cron) with do(...)` 블록을 실행해요).
+
+트리거별 이벤트 모양·body 컨벤션·함정은 [트리거](/docs/handlers/triggers)에서 다뤄요.
+
+## 템플릿 변수
+
+CLI가 파일을 복사할 때 두 토큰을 치환해요:
+
+| 토큰 | 치환 대상 | 사용처 |
+|---|---|---|
+| `{{project}}` | `init`의 첫 위치 인자 | `api.py` 리소스 이름, `aws_iam_policy_*.json` ARN, `secret_manager` 경로 |
+| `{{app}}` | `init`의 두 번째 위치 인자 (또는 `add`의 유일한 인자) | `aws_handler.py` import, 컨트롤러 `cmd` prefix, Dockerfile `CMD` |
+
+프로젝트나 앱 이름을 바꿀 일이 생기면, 개별 파일을 편집하지 말고 **이 토큰들로 find-and-replace** 해 주세요. 여러 파일(Dockerfile, buildspec, IAM, build_keeper)에 등장해요.
+
+## CLI가 **하지 않는** 것
+
+`awsi`는 소스 파일만 만들어요. 다음은 하지 않아요:
+
+- ECR 리포지토리 생성 (콘솔 또는 `aws ecr create-repository`로 1회 직접 해 주세요).
+- Lambda 함수 생성 (ECR 이미지를 가리키는 함수 셸을 직접 만들어야 해요 — [배포](/docs/deployment/deployment) 참고하세요).
+- 트리거 연결 (API Gateway 라우트, SQS event-source mapping, EventBridge 규칙 — 모두 수동으로 설정해야 해요).
+- `awsi add` 후 IAM 정책 갱신 (새 함수의 권한 요구를 `aws_iam_policy_{env}.json`에 직접 추가해야 해요).
+
+이건 CLI가 의도적으로 범위 밖으로 둔 AWS 계정 작업이에요. 보일러플레이트는 **코드**이고, AWS 스캐폴드는 운영 영역이에요.
+
+## 보일러플레이트 해부
+
+CLI가 만드는 모든 파일과 역할을 정리하면 다음과 같아요:
+
+```
+sawsi_boilerplate/                       (템플릿)
+├── api.py                               → 당신의 AWS 리소스 싱글턴
+├── config.py                            → env/region 읽기, build 플래그
+├── errs.py                              → 앱 고유 AppError 정의
+├── build_keeper.py                      → 배포마다 1회 init
+├── requirements.txt                     → pip 의존성
+├── Dockerfile                           → Lambda 컨테이너 이미지
+├── buildspec-lambda-{dev,prod}.yml      → zip 기반 CodeBuild
+├── buildspec-docker-{dev,prod}.yml      → 컨테이너 기반 CodeBuild
+├── aws_iam_policy_{dev,prod}.json       → IAM 정책 템플릿
+└── {{app}}/
+    ├── __init__.py
+    ├── aws_handler.py                   → 람다 진입점 (-t에 따라 다름)
+    ├── local_server.py                  → Flask 어댑터 (-t agw 한정)
+    ├── doc_maker.py                     → DocMaker 연동
+    ├── controller/
+    │   ├── __init__.py
+    │   └── auth.py                      → @controller 예시
+    ├── service/
+    │   └── auth_service.py              → 비즈니스 로직
+    └── model/
+        ├── __init__.py
+        └── sample_user.py               → DynamoModel 예시
+```
+
+모든 파일이 한 자리에서 읽을 만큼 충분히 작아요. `awsi init` 직후에 한 번 훑어 보세요 — 프레임워크 문서의 일부라고 생각하면 돼요.
+
+## 버전 관리
+
+CLI 버전은 라이브러리 버전을 따라가요. `sawsi==20.10`은 `awsi` 20.10을 출시해요. 별도 CLI 릴리스 채널은 없어요.
+
+업그레이드는 이렇게 해요:
+
+```bash
+pip install -U sawsi
+```
+
+기존 프로젝트에서 `awsi init`을 다시 돌려도 안전해요. 누락된 파일만 새로 받아 와요. 업그레이드 후 기존 파일을 *갱신*하고 싶다면, 새 패키지의 `sawsi_boilerplate/`와 비교해서 직접 머지해 주세요.

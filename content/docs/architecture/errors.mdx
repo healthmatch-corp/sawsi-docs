@@ -1,0 +1,216 @@
+---
+title: Errors & result codes
+description: The A/B/U code system, AppError, ignore lists, and how exceptions become responses.
+---
+
+Every response from a sawsi handler carries a `rslt_cd` field. Clients branch on this code; on-call engineers grep for it. The system is small but strict — if you fight it, you get garbled alerts and confused clients.
+
+## The code system
+
+```
+A     Success
+B     Business error (library + application)
+U     Unknown — uncaught exception
+```
+
+| Prefix | Range | Meaning |
+|---|---|---|
+| `A00000` | one value | Generic success. Wrapper assigns this automatically. |
+| `B00xxx` | library-reserved | Errors raised by sawsi itself (`B00001`: no such cmd, `B00006`: prefix not allowed, etc.). |
+| `B1xxxx`, `S0001`+ | yours | Application errors. Pick a non-colliding prefix. |
+| `U99999` | one value | Unknown exception. The wrapper assigns this when your code raises something that isn't an `AppError`. |
+
+**Rule of thumb**: never define application errors with prefix `A`, `U`, or `B0xxxx`. Use `B1xxxx`, `B2xxxx`, …, or a per-category letter (`S` for system, `E` for events, etc. — as long as it doesn't collide with library codes).
+
+## Defining errors
+
+```python title="errs.py"
+from sawsi.shared.error_util import AppError
+
+err_n = 1
+def auto(category: str):
+    global err_n
+    n = err_n
+    err_n += 1
+    return f'{category}{n:04d}'
+
+# Auth
+no_session = AppError(auto('S'), 'no_session')
+invalid_session = AppError(auto('S'), 'invalid_session')
+permission_denied = AppError(auto('S'), 'permission_denied')
+invalid_otp = AppError(auto('S'), 'invalid_otp')
+
+# Phone / SMS
+invalid_phone = AppError(auto('S'), 'invalid_phone')
+sms_send_failed = AppError(auto('S'), 'sms_send_failed')
+
+# Events
+already_in_event = AppError(auto('E'), 'already_in_event')
+exceed_max_participant_count = AppError(auto('E'), 'exceed_max_participant_count')
+```
+
+`auto()` generates incrementing codes within each category, so adding a new error doesn't reshuffle existing ones. Codes once assigned must not move — clients may be coded against specific values.
+
+## Raising
+
+```python
+@controller
+def join_event(user, event_id: str, **kwargs):
+    event = Event.get(event_id)
+    if not event:
+        raise errs.no_such_event
+    if event.participant_count >= event.max_participant_count:
+        raise errs.exceed_max_participant_count
+    ...
+```
+
+The handler wrapper catches `AppError`, builds a response, and (depending on the `ignore_app_errors` list) optionally calls `error_receiver` for alerting.
+
+## What the wrapper does
+
+Per request, the wrapper's exception path looks like:
+
+```python
+try:
+    result = handler(event, context)
+except AppError as ex:
+    body = {
+        'rslt_cd': str(ex.code),
+        'rslt_msg': str(ex.message),
+        'duration': time.time() - start,
+    }
+    if ex.code not in [e.code for e in ignore_app_errors]:
+        error_receiver(make_error_description(event))
+    return AWSResponse(body)
+except Exception as ex:
+    body = {
+        'rslt_cd': 'U99999',
+        'rslt_msg': str(ex),
+        'duration': time.time() - start,
+    }
+    if use_traceback:
+        body['traceback'] = traceback.format_exc()
+    error_receiver(traceback.format_exc())
+    return AWSResponse(body)
+```
+
+## `ignore_app_errors` — silent failures
+
+Some `AppError`s are routine and shouldn't page on-call:
+
+```python
+@aws_handler_wrapper(
+    error_receiver=slack_notify,
+    ignore_app_errors=[
+        errs.no_session,           # users who happen to not be logged in
+        errs.invalid_session,      # expired sessions
+        errs.invalid_phone,        # bad input
+        errs.exceed_max_participant_count,   # known business condition
+    ],
+)
+def handler(event, context):
+    ...
+```
+
+The response still goes back with the right `rslt_cd`. The on-call channel just doesn't get notified.
+
+The list grows organically: when an error fires often enough to be noise, add it.
+
+## `use_traceback`
+
+```python
+@aws_handler_wrapper(use_traceback=True)
+```
+
+When True, unknown exceptions include their traceback in the response body. **Only in dev.** Tracebacks expose file paths, line numbers, and variable names — useful debugging, terrible security.
+
+For prod, the wrapper still **logs** the traceback through `error_receiver`; only the client-visible body is sanitized.
+
+## `error_receiver`
+
+A callable that takes one string argument. Examples:
+
+```python
+def slack_notify(message):
+    requests.post(SLACK_WEBHOOK, json={'text': message})
+
+def discord_notify(message):
+    ...
+
+def stdout(message):
+    print(message)
+```
+
+The wrapper calls it for:
+
+- Every uncaught exception.
+- Every `AppError` not in `ignore_app_errors`.
+
+If `error_receiver=None`, no notification is sent. Use stdout for dev, a webhook for prod.
+
+## Response shape
+
+Success:
+
+```json
+{
+  "rslt_cd": "A00000",
+  "rslt_msg": "요청 성공",
+  "duration": 0.042,
+  "your_data": { ... }
+}
+```
+
+Business error:
+
+```json
+{
+  "rslt_cd": "S0007",
+  "rslt_msg": "already_in_event",
+  "duration": 0.018
+}
+```
+
+Unknown:
+
+```json
+{
+  "rslt_cd": "U99999",
+  "rslt_msg": "AttributeError: 'NoneType' object has no attribute 'foo'",
+  "duration": 0.062
+}
+```
+
+(With `use_traceback=True`, the unknown response also has a `traceback` field.)
+
+## Localized error messages
+
+The `rslt_msg` is a stable English-ish identifier (`'already_in_event'`). Clients pass it through their own i18n layer:
+
+```typescript
+// client
+const message = i18n[response.rslt_msg] ?? defaultErrorMessage;
+```
+
+If you need to localize **on the server**, run `tr(rslt_msg, group='errors').<lang>` before returning. But the rslt_msg should remain stable — clients shouldn't have to parse Korean.
+
+## Anti-patterns
+
+- **Raising raw `Exception`** from a controller — gives the client `U99999` and pages on-call. Always use `AppError`.
+- **Defining your codes in `A0xxxx` or `B0xxxx`** — collides with sawsi library codes. Use `B1xxxx`+ or a non-`B` prefix.
+- **Returning `{'rslt_cd': 'B12345'}` from a controller** instead of raising — works, but the wrapper now treats it as success (no `error_receiver` call), so a real business error doesn't show up in alerts. Use `raise AppError(...)`.
+- **Catching `AppError` inside the controller** — almost always wrong. Let it bubble.
+
+## What about validation?
+
+Pydantic does the syntactic validation (types, required fields) automatically by virtue of controllers being typed functions. Semantic validation (uniqueness, range, business rules) you do in controllers or services:
+
+```python
+@controller
+def update_email(user, email: str, **kwargs):
+    if not re.match(EMAIL_REGEX, email):
+        raise errs.invalid_email
+    ...
+```
+
+Pydantic validation errors will surface as `U99999` (unknown) by default — to convert them to a clean `AppError`, wrap the function body in a try/except or define a Pydantic-aware error in your codebase.

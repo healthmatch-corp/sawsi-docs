@@ -1,0 +1,203 @@
+---
+title: 트리거
+description: API Gateway, SQS, EventBridge, WebSocket, S3, 웹훅 — 여섯 이벤트 소스, 하나의 라우팅 패턴을 다뤄요.
+---
+
+sawsi 프로젝트는 보통 여러 람다 함수를 가지고, 각각 `awsi add <app> -t <trigger>`로 스캐폴딩해요. 각 핸들러 본문은 같은 세 가지를 해요 — `event`에서 추출하고, `body`로 정규화하고, 디스패치해요 — 하지만 이벤트 모양과 디스패치 키는 트리거마다 달라요.
+
+## API Gateway (`-t agw`)
+
+기본 트리거예요. 엔드포인트 하나, JSON body가 들어오고 JSON body가 나가요.
+
+```python title="main/aws_handler.py"
+@handler_util.aws_handler_wrapper(
+    error_receiver=slack_notify,
+    use_traceback=False,
+    ignore_app_errors=[errs.no_session],
+)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+    source_ip = handler_util.get_source_ip(event, context)
+    req_ts = int(event['requestContext']['requestTimeEpoch']) / 1000
+
+    body['user'] = None
+    body['source_ip'] = source_ip
+    body['req_ts'] = req_ts
+
+    if (sid := headers.get('session_id')):
+        body['user'] = auth_service.get_me(session_id=sid, req_ts=req_ts)
+
+    cmd = body.pop('cmd')
+    return router(cmd, body, headers, allowed_cmd_prefixes=['main.controller'])
+```
+
+주목할 점이에요:
+
+- 인증이 body 정규화와 `router()` **사이**에서 실행돼서, 시그니처 주입을 통해 모든 컨트롤러가 user 객체를 받을 수 있어요.
+- 세션 없이도 도달해야 하는 컨트롤러가 있어요 (회원가입, 로그인, 비밀번호 재설정). 인라인 화이트리스트를 써 주세요:
+
+```python
+if cmd in NO_SESSION_CMDS or sid:
+    return router(cmd, body, headers, allowed_cmd_prefixes=['main.controller'])
+raise errs.no_session
+```
+
+## SQS (`-t sqs`)
+
+큐 워커예요. 이벤트는 `{'Records': [{'body': '...json...', ...}, ...]}` 모양이에요.
+
+```python title="queue_receiver/aws_handler.py"
+@handler_util.aws_handler_wrapper(use_traceback=True)
+def handler(event, context):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = []
+        for record in event['Records']:
+            message = json.loads(record['body'])
+            cmd = message['type']
+            body = message.get('body', {})
+            futures.append(pool.submit(_handle_one, cmd, body))
+        for f in futures:
+            f.result()   # SQS 재시도를 위해 예외를 표면화해요
+    return None
+
+def _handle_one(cmd, body):
+    return router(cmd, body, {}, allowed_cmd_prefixes=['queue_receiver.controller'])
+```
+
+컨벤션은 이래요:
+
+- 송신자는 `{'type': 'queue_receiver.controller.x.y', 'body': {...}}`를 SQS에 넣어요.
+- 워커는 `type`을 cmd로, `body`를 컨트롤러 인자로 취급해요.
+
+future에서 예외를 다시 raise하는 게 중요해요 — 삼키면 SQS가 배치를 성공으로 표시하고 재시도하지 않아요.
+
+## EventBridge Scheduler (`-t ebs`)
+
+이 람다를 분당 1회 (또는 EventBridge 규칙대로) 호출해요. 내부에서 `ScheduledTask`로 여러 cron 매칭 작업으로 fan-out해요.
+
+```python title="scheduler/aws_handler.py"
+from sawsi.shared.schedule_util import ScheduledTask, join
+
+def handler(event, context):
+    # 매시 :01 — 매칭 리마인더
+    with ScheduledTask('1 * * * *') as do:
+        from scheduler.controller import match
+        do(match.send_pre_match_notifications)
+
+    # 매분 — 봇 스케줄링
+    with ScheduledTask('* * * * *') as do:
+        from scheduler.controller import bots
+        do(bots.tick)
+
+    # 금요일 11:00 — 주간 통계
+    with ScheduledTask('0 11 * * 5') as do:
+        from scheduler.controller import stats
+        do(stats.send_weekly_summary)
+
+    join()  # 모든 백그라운드 스레드를 기다려요
+    return None
+```
+
+`ScheduledTask` 동작 방식은 이래요. 진입할 때 cron이 *지금*과 맞는지 확인해요. 맞으면 `do(func)`가 함수를 백그라운드 스레드에 예약해 줘요. 아니면 `do`는 no-op이에요. `join()`이 이 호출 동안 시작된 모든 백그라운드 스레드를 기다려 줘요.
+
+일관된 로깅을 원하면 같은 `aws_handler_wrapper`를 써도 돼요. 다만 스케줄러 람다는 API Gateway 모양 응답을 반환할 필요는 없어요.
+
+## WebSocket (`-t ws`)
+
+API Gateway WebSocket 라우트 — `$connect`, `$disconnect`, `$default` — 가 모두 한 핸들러로 들어와요.
+
+```python title="websocket_receiver/aws_handler.py"
+def handler(event, context):
+    route_key = event['requestContext']['routeKey']
+    connection_id = event['requestContext']['connectionId']
+
+    if route_key == '$connect':
+        return _on_connect(event, connection_id)
+    if route_key == '$disconnect':
+        return _on_disconnect(connection_id)
+
+    body = json.loads(event['body'])
+    cmd = body.pop('cmd')
+    body['connection_id'] = connection_id
+    return router(cmd, body, {}, allowed_cmd_prefixes=['websocket_receiver.controller'])
+```
+
+연결된 클라이언트로 메시지를 푸시하려면 이렇게 해요:
+
+```python
+import api
+api.apigw.post_to_connection(data=json.dumps({...}), connection_id=connection_id)
+```
+
+`api.apigw`는 `APIGatewayManagement` 래퍼예요. 엔드포인트 URL은 `api.py`에 설정하고 환경별로 달라요 (dev WebSocket API와 prod의 `execute-api` 호스트가 달라요).
+
+## S3 트리거
+
+S3 이벤트는 객체가 생성/삭제될 때 발생해요. 키 prefix로 디스패치해요:
+
+```python title="s3trigger/aws_handler.py"
+def handler(event, context):
+    for record in event['Records']:
+        object_key = record['s3']['object']['key']
+        event_name = record['eventName']  # ObjectCreated:Put 등
+
+        if object_key.startswith('image/'):
+            from s3trigger.controller import image_convert
+            image_convert.convert_to_webp(object_key)
+        elif object_key.startswith('video/'):
+            from s3trigger.controller import video_convert
+            video_convert.convert_to_mp4(object_key)
+    return None
+```
+
+이 트리거는 `cmd` 라우팅이 별 이득을 주지 않는 유일한 곳이에요 — 디스패치가 외부 객체 키에 의해 결정되거든요. 단순한 `if/elif` 체인이 컨벤션이에요.
+
+## 웹훅 수신기 (`-t webhook`)
+
+서드파티(결제 제공자, 앱 스토어, OAuth 제공자)의 인바운드 HTTPS POST용이에요. cmd는 body가 아니라 쿼리스트링에서 와요:
+
+```python title="webhook_receiver/aws_handler.py"
+@handler_util.aws_handler_wrapper(use_traceback=False)
+def handler(event, context):
+    qs = event.get('queryStringParameters') or {}
+    cmd = qs.get('cmd')
+    if not cmd:
+        raise errs.no_cmd
+
+    body = handler_util.get_body(event, context) or {}
+    body['headers'] = handler_util.get_headers(event, context)
+    body['raw_body'] = event.get('body')   # 서명 검증용이에요
+
+    return router(cmd, body, {}, allowed_cmd_prefixes=['webhook_receiver.controller'])
+```
+
+`webhook_receiver.controller.*` 컨트롤러는 보통 이런 흐름이에요:
+
+1. `raw_body`와 `api.secret_manager`의 시크릿으로 요청 서명을 검증해요.
+2. 페이로드를 파싱해요.
+3. DynamoDB를 업데이트하고, 필요하면 SQS로 다운스트림 작업을 트리거해요.
+
+## 람다 간 호출
+
+한 람다가 다른 람다에 작업을 큐잉할 때예요:
+
+| From → To | 방법 |
+|---|---|
+| 임의 → SQS 워커 | `api.sqs.send_message(json.dumps({'type': '<cmd>', 'body': {...}}))` |
+| API Gateway → 다른 API Gateway 람다 | `api.lambda_client.invoke(function_name, payload)` (동기) 또는 SQS 경유 (비동기) |
+| 임의 → WebSocket 클라이언트 | `api.apigw.post_to_connection(...)` |
+| 임의 → SNS 토픽 | `api.sns.send_message(topic_arn, message)` |
+
+## 트리거 선택
+
+| 코드가... | 트리거 |
+|---|---|
+| ...사용자 HTTPS 요청에 응답 | `agw` |
+| ...동기 응답으로 느린 백그라운드 작업 | `sqs` |
+| ...스케줄로 실행 | `ebs` |
+| ...파일 업로드에 반응 | S3 trigger |
+| ...클라이언트에 실시간 푸시 | `ws` |
+| ...서드파티 콜백 수신 | `webhook` |
+
+각 트리거의 전체 레퍼런스는 [다중 람다 구성](/docs/architecture/multi-lambda) 챕터에 있어요. 한 프로젝트에서 이 트리거들이 어떻게 공존하는지 다뤄요.

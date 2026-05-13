@@ -1,0 +1,170 @@
+---
+title: 어드민 서브시스템
+description: 분리된 람다, 분리된 인증, 그룹 스코프 cmd/IP 화이트리스트를 다뤄요.
+---
+
+sawsi 프로젝트의 어드민 표면은 사용자 표면과 의도적으로 분리돼요 — 분리된 람다 함수, 어드민용 분리된 모델, 분리된 권한 모델, 분리된 `cmd` prefix 집합으로 구성돼요. 이 격리에는 람다 함수 하나가 더 든다는 비용이 있지만, 그 대신 깔끔한 보안 경계를 얻을 수 있어요.
+
+## 왜 분리할까요
+
+사용자 람다의 플래그가 아닌 자체 람다로 만드는 두 가지 이유가 있어요.
+
+- **IAM 폭발 반경.** 어드민 함수는 종종 더 넓은 권한이 필요해요 (모든 사용자 쓰기, 분석 스캔 실행 등). 사용자 함수에 그 권한을 주고 코드에서 게이트하는 건 실수 한 번이면 재앙인 구성이에요.
+- **Cmd 표면.** `admin.controller.*`는 완전히 다른 라우팅 prefix예요. 사용자 람다의 `allowed_cmd_prefixes`가 admin을 제외하므로, 잘못 설정된 클라이언트도 어드민 엔드포인트에 도달할 수 없어요.
+
+## 모델들
+
+```python title="admin/model/admin_manager.py"
+@sync
+class AdminManager(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'admin_manager'
+    _indexes = [('phone', 'crt')]
+
+    name: str
+    birth: str
+    phone: str
+    group: Literal['root', 'master', 'manager']
+    password_hash: str
+    password_salt: str
+
+    @classmethod
+    def get_by_phone(cls, phone):
+        items, _ = cls.query(pk_field='phone', pk_value=phone, sk_field='crt', limit=1, reverse=True)
+        return items[0] if items else None
+```
+
+```python title="admin/model/admin_group.py"
+@sync
+class AdminGroup(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'admin_group'
+
+    name: str
+    admin_manager_ids: list[str] = []
+    allow_cmds: list[str] = []     # 명시적 cmd 화이트리스트, 또는 전체 허용 ['*']
+    allow_menus: list[str] = []    # UI 메뉴 가시성 (프론트엔드가 소비)
+    allow_ips: list[str] = []      # IP 화이트리스트, 또는 ['*']
+```
+
+세 가지 그룹 레벨이 있어요.
+
+| 그룹 | 동작 |
+|---|---|
+| `root` | 무조건 접근해요. 인간 운영자 한두 명이에요. |
+| `master` | 무조건 접근해요. 보통 엔지니어링 팀이에요. |
+| `manager` | 그룹 멤버십으로 권한이 결정돼요: cmd 화이트리스트 + IP 화이트리스트. |
+
+무조건 그룹은 비상용이에요 — 세분 시스템에서 자신을 잠그더라도 `root`/`master`는 작동해요.
+
+## 핸들러
+
+어드민 람다는 세 가지 검사를 순서대로 실행해요 — 세션, 그룹, IP — 그리고 그 후에만 디스패치해요.
+
+```python title="admin/aws_handler.py"
+NO_SESSION_CMDS = {
+    'admin.controller.admin_auth.send_sms_auth_code',
+    'admin.controller.admin_auth.get_sms_auth_token',
+    'admin.controller.admin_member.login',
+}
+
+@handler_util.aws_handler_wrapper(use_traceback=True)    # 어드민은 use_traceback OK
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+    source_ip = handler_util.get_source_ip(event, context)
+    cmd = body.get('cmd')
+
+    sid = headers.get('session_id')
+    if not sid and cmd not in NO_SESSION_CMDS:
+        raise errs.no_session
+
+    me = None
+    if sid:
+        me = _get_admin_me(sid)                 # AdminManager
+        body['me'] = me
+
+    # cmd가 세션 없음이 아니면 그룹 + IP 게이트
+    if cmd not in NO_SESSION_CMDS:
+        if me.group not in ('root', 'master'):
+            if not admin_group_service.can_access_cmd(me.id, cmd, source_ip):
+                raise errs.permission_denied
+
+    # 파괴적 작업을 위한 추가 게이트
+    if cmd in ROOT_ONLY_CMDS and me.group != 'root':
+        raise errs.permission_denied
+
+    return router(cmd, body, headers, allowed_cmd_prefixes=['admin.controller'])
+```
+
+`can_access_cmd`는 관리자의 그룹들을 읽고 **적어도 하나의** 그룹이 `allow_cmds`에 cmd가 있고(또는 `'*'`) `allow_ips`에 IP가 있을 때(또는 `'*'`)만 True를 반환해요.
+
+```python title="admin/service/admin_group_service.py"
+def can_access_cmd(admin_manager_id, cmd, source_ip):
+    groups = _all_admin_groups()
+    groups = [g for g in groups if admin_manager_id in g.admin_manager_ids]
+    for group in groups:
+        ip_ok = source_ip in group.allow_ips or '*' in group.allow_ips
+        cmd_ok = cmd in group.allow_cmds or '*' in group.allow_cmds
+        if ip_ok and cmd_ok:
+            return True
+    return False
+```
+
+## 어드민 cmd 자동 나열
+
+어드민 UI 자체에서 `allow_cmds` 선택지를 채우기 위해, sawsi는 controller 디렉터리를 순회하며 모든 `cmd` 문자열을 내놓는 AST 헬퍼를 가지고 있어요.
+
+```python title="path_util.py (프로젝트 루트)"
+import ast, os, pkgutil
+
+def extract_admin_cmds_from_controller():
+    cmds = []
+    base = 'admin/controller'
+    for root, _, files in os.walk(base):
+        for fname in files:
+            if not fname.endswith('.py'):
+                continue
+            module_path = root.replace('/', '.') + '.' + fname[:-3]
+            tree = ast.parse(open(os.path.join(root, fname)).read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    if any(
+                        isinstance(d, ast.Name) and d.id == 'controller'
+                        for d in node.decorator_list
+                    ):
+                        cmds.append(f'{module_path}.{node.name}')
+    return cmds
+```
+
+그리고 이 리스트를 반환하는 cmd를 노출하면, 어드민 UI가 모든 컨트롤러에 대한 체크박스를 표시해줘요.
+
+## 흔한 패턴
+
+### 파괴적 작업은 root 한정
+
+```python
+ROOT_ONLY_CMDS = {
+    'admin.controller.admin_member.create_admin',
+    'admin.controller.admin_member.delete_admin',
+    'admin.controller.system.purge_user',
+}
+```
+
+핸들러에서 명시적으로 게이트해 주세요 — 그룹 규칙에 의존하지 마세요. 잘못 설정된 그룹 하나가 계정 삭제를 활성화해서는 안 돼요.
+
+### 감사 로깅
+
+Firehose를 사용해요: 컨트롤러가 반환된 후 `api.firehose_log.put_record(json.dumps({'admin_id': me.id, 'cmd': cmd, 'body': body, 'ts': time.time()}))`을 호출해요. Firehose가 S3에 영구화해줘요.
+
+### 어드민용 doc maker
+
+어드민 람다는 보통 사용자 측과 유사한 `doc_maker.py`를 출시하지만 어드민 API Gateway URL을 가리켜요. 결과는 모든 어드민 엔드포인트를 나열하는 Swagger인데 — 비엔지니어 운영자에게 매우 유용해요.
+
+## 이것이 **아닌** 것
+
+- 완전한 RBAC 시스템이 아니에요. 객체-레벨 역할이 없어요 (예: "매니저 X가 이벤트 Y를 소유"). 시스템은 cmd × IP, 그 이상이 아니에요.
+- OIDC 통합이 아니에요. 어드민은 phone + password + SMS 코드로 로그인해요. SSO를 원하면 위에 작성해야 해요.
+- 멀티 테넌트가 아니에요. 시스템은 같은 데이터 플레인을 운영하는 적은 수의 어드민을 가정해요.
+
+이 한계를 넘어서면 보통 업그레이드 경로는 이 시스템의 확장이 아니라 별도 IAM 기반 어드민 제품이에요.

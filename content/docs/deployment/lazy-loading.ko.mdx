@@ -1,0 +1,181 @@
+---
+title: 지연 초기화 & 콜드스타트
+description: LazyLoadedAPI가 api.py의 import 타임을 어떻게 무료로 유지하는지, 그리고 람다 컨테이너 라이프사이클과의 상호작용을 알려드려요.
+---
+
+`api.py`가 모듈 레벨에서 AWS 클라이언트 열 개를 선언해도 콜드스타트를 망치지 않는 이유는 `LazyLoadedAPI` 덕분이에요. 이 페이지에서는 어떻게 동작하는지, 왜 중요한지, 그리고 알아 두어야 할 람다 컨테이너 재사용과의 미묘한 상호작용을 설명해 드려요.
+
+## 클래스
+
+```python title="sawsi/shared/class_util.py"
+import threading
+
+class LazyLoadedAPI:
+    def __init__(self, api_class, *args, **kwargs):
+        self.api_class = api_class
+        self.args = args
+        self.kwargs = kwargs
+        self._instance = None
+        self._lock = threading.Lock()
+
+    def _initialize_instance(self):
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:
+                    self._instance = self.api_class(*self.args, **self.kwargs)
+
+    def __getattr__(self, name):
+        self._initialize_instance()
+        return getattr(self._instance, name)
+```
+
+세 가지 일이 일어나요:
+
+- 생성자가 **감싸진 API 클라이언트를 만들지 않아요** — 단지 생성자 인자만 저장해요.
+- 첫 속성 접근이 `_initialize_instance`를 트리거해서 진짜 클라이언트를 생성해요 (`DynamoDBAPI(...)`, `S3API(...)` 등).
+- 생성은 `threading.Lock`과 더블 체크로 보호돼요 — 콜드 인스턴스에 대한 동시 속성 접근이 클라이언트를 정확히 한 번 만들어요.
+
+## 왜 중요한가
+
+### 1. 모듈 import가 무료가 돼요
+
+```python
+# api.py
+dynamo: DynamoDBAPI = LazyLoadedAPI(DynamoDBAPI, f'{env}-{project}', region=region)
+s3_public: S3API   = LazyLoadedAPI(S3API,         f'{env}-{project}-public', region=region)
+secret_manager     = LazyLoadedAPI(SecretManagerAPI, f'{env}/{project}', region=region)
+...
+```
+
+이 모듈을 import하면 **열** 개의 `LazyLoadedAPI` 객체가 인스턴스화돼요 — 각자 그저 생성자 인자만 보관해요. boto3 클라이언트 생성도 없고, AWS 자격증명도 손대지 않고, HTTP 연결도 열지 않아요.
+
+`LazyLoadedAPI` 없이는 매 `api.py` import가 boto3 클라이언트 열 개를 만들어요. 매 콜드스타트마다 약 200–500ms의 CPU + 자격증명 읽기 시도가 발생해요 — 요청이 그중 하나만 건드려도요.
+
+### 2. 빌드 타임이 AWS-free로 유지돼요
+
+`build_keeper.py`는 `api.dynamo.create_table(...)`을 호출하기 위해 `api.py`를 import해요. 지연 로딩 없이는 import 자체가 AWS 자격증명을 필요로 해서 — 로컬 `python build_keeper.py`가 아무것도 하기 전에 실패해요.
+
+지연 로딩으로 어떤 컨텍스트(로컬 dev, AWS 없는 CI, 문서 생성)에서도 `import api`가 가능하며, 실제로 AWS가 필요한 호출만 자격증명을 요구해요.
+
+### 3. 테스트가 자유롭게 import 가능
+
+```python
+def test_some_logic():
+    from main.service import some_service
+    # `some_service`가 나중에 `api.dynamo.query(...)`를 하기 위해 `api`를 import해요
+    # — 하지만 import만으로는 DynamoDB 연결을 열지 않아요
+    ...
+```
+
+테스트가 실제로 `api.*` 메서드를 호출하지 않는 한, AWS를 mocking 없이 비즈니스 로직 단위 테스트를 작성할 수 있어요.
+
+## 콜드스타트 상호작용
+
+람다 **컨테이너**는 콜드스타트부터 AWS가 재활용할 때까지 살아 있어요 (보통 비활성 분~시간, 또는 플랫폼 업데이트). 모든 `LazyLoadedAPI` 인스턴스가 그 컨테이너 메모리에 거주해요.
+
+콜드스타트 후 **첫** 요청이 그 요청이 건드리는 서비스에 대해 초기화를 트리거해요. 로그인 요청은 `api.dynamo`와 `api.secret_manager`를 건드려요 — 둘이 초기화되고, 나머지 여덟은 지연 상태로 유지돼요.
+
+같은 컨테이너 안의 **두 번째** 요청은 warm 상태예요: 관련 API 클라이언트가 이미 만들어져 있고, 이후 호출이 재사용해요.
+
+이게 의미하는 것은 이래요:
+
+- **첫 요청이 사용하는 AWS 클라이언트만큼 조금 느려요.** 일반 비용: 클라이언트당 50–150ms.
+- **이후 요청은 빨라요** — 컨테이너 재활용까지요.
+- **분당 실행되는 스케줄러 람다**는 지속 warm 상태이므로 콜드스타트 비용을 대략 1회 지불해요.
+- **드물게 호출되는 람다**는 대부분 호출에서 콜드스타트 비용을 지불해요.
+
+특정 함수의 콜드스타트 지연이 임계적이면, 람다 **Provisioned Concurrency**로 N개 컨테이너를 항상 warm으로 유지해 주세요.
+
+## SecretsManager 캐시와 회전
+
+`SecretManagerAPI`는 복호화된 시크릿 값의 **인스턴스 레벨 캐시**를 유지해요. 래퍼 인스턴스가 컨테이너 수명 동안 살아 있으므로 캐시도 그만큼 유지돼요.
+
+```python
+key1 = api.secret_manager.get_secret_value('openai_key')   # KMS 복호화
+key2 = api.secret_manager.get_secret_value('openai_key')   # 메모리 캐시
+key3 = api.secret_manager.get_secret_value('slack_webhook') # KMS 복호화 (다른 키)
+```
+
+함의는 이래요:
+
+- **비용.** KMS 복호화는 호출당 청구돼요. 캐시가 핫패스에서 비용을 절감해요.
+- **회전.** AWS에서 시크릿 회전은 캐시 값을 **무효화하지 않아요**. 기존 warm 컨테이너는 재활용까지 옛 값을 사용해요 (분~시간). 새 콜드스타트 컨테이너가 새 값을 픽업해요.
+
+회전된 시크릿을 즉시 전파해야 한다면 재배포를 강제해 주세요 — 모든 컨테이너가 재활용돼요.
+
+## 안티 패턴
+
+### 모듈 최상위에서 AWS 호출
+
+```python
+# 잘못된 예
+import api
+ALLOWED_IPS = api.secret_manager.get_secret_value('allowed_ips').split(',')
+```
+
+이는 모듈 import 타임에 `api.secret_manager` 초기화를 강제하고 KMS 호출을 만들어요. 함수나 지연 프로퍼티로 옮겨 주세요:
+
+```python
+# 올바른 예
+_ALLOWED_IPS = None
+def allowed_ips():
+    global _ALLOWED_IPS
+    if _ALLOWED_IPS is None:
+        _ALLOWED_IPS = api.secret_manager.get_secret_value('allowed_ips').split(',')
+    return _ALLOWED_IPS
+```
+
+### api.py 밖에서 래퍼 인스턴스화
+
+```python
+# 잘못된 예 — 호출마다 새 클라이언트 생성
+def handler(event, context):
+    s3 = S3API(bucket_name, region=region)
+    s3.upload_file(...)
+```
+
+`S3API` 생성은 비싸요 (boto3 클라이언트를 지연 생성해요). 항상 `api.py`를 경유해 주세요. agent-skills의 린터(`sawsi_lint.py`)가 이 패턴을 잡아줘요.
+
+### `_instance`에 손대기
+
+```python
+# 잘못된 예
+client = api.dynamo._instance._raw_dynamo_client
+```
+
+언더스코어 prefix가 계약이에요 — 내부물이에요. 래퍼의 공개 메서드를 써 주세요.
+
+## 컨테이너 라이프사이클 특이점
+
+- 같은 람다의 **동시 호출**이 추가 컨테이너를 띄워요. 각 컨테이너는 자체 `LazyLoadedAPI` 인스턴스 사본을 보유해요.
+- **Reserved Concurrency** 1은 단일 컨테이너를 강제해요 — 외부 리소스 핸들에 엄격한 싱글턴을 원할 때 유용해요.
+- **`/tmp`는 컨테이너별**, 기본 512 MB예요. 거기 파일을 캐싱하면 요청별이 아니라 컨테이너별이라는 점을 기억해 주세요.
+
+## 콜드스타트 프로파일
+
+`aws_handler.py`에 마커를 추가해 주세요:
+
+```python
+import time
+IMPORT_T = time.time()
+import api
+API_IMPORTED_T = time.time()
+
+@aws_handler_wrapper(...)
+def handler(event, context):
+    print(f'handler invoked: api_imported={API_IMPORTED_T - IMPORT_T:.3f}s '
+          f'first_request={time.time() - API_IMPORTED_T:.3f}s')
+    ...
+```
+
+두 마커를 빼서 `import api`가 얼마나 걸렸는지 vs 요청 지연의 얼마가 핸들러 로직에 있는지 확인해 주세요.
+
+## 이것이 *아닌* 것
+
+- 싱글턴 강제 메커니즘이 아니에요. 어딘가에서 `S3API(...)`를 직접 인스턴스화하면 별개의 클라이언트를 얻어요. 컨벤션은 `api.py` 한정이에요 — 린터가 위반을 잡아줘요.
+- async-safe 락이 아니에요. `threading.Lock`은 람다 안의 스레드풀 동시성에 동작하지만 asyncio엔 아니에요. `LazyLoadedAPI`를 async 코드 안에 넣지 말아 주세요.
+
+## 다음
+
+- [보안 자세](/docs/deployment/security) — 이 기반 위에 있는 것.
+- [다중 람다 구성](/docs/architecture/multi-lambda) — 함수별 콜드스타트 전략 변형.

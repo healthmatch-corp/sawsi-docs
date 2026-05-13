@@ -1,0 +1,185 @@
+---
+title: Multi-Lambda layout
+description: One project, many Lambdas — how the directories, the shared singletons, and the cmd prefixes coexist.
+---
+
+A real sawsi project usually grows into more than one Lambda. This page covers the standard topology, the directory layout each Lambda follows, and how shared code is organized so that "many Lambdas, one codebase" actually works.
+
+## The standard topology
+
+A production project commonly has 6–8 Lambdas:
+
+```
+                         ┌───────────────────────┐
+   client app  ─────────▶│ main (API Gateway)    │
+                         └───────────┬───────────┘
+                                     │ enqueue
+                                     ▼
+                         ┌───────────────────────┐
+                         │ queue_receiver (SQS)  │
+                         └───────────────────────┘
+
+   admin client  ───────▶│ admin (API Gateway)   │
+                         └───────────────────────┘
+
+   third party ─────────▶│ webhook_receiver      │
+                         └───────────────────────┘
+
+   EventBridge ─────────▶│ scheduler (1 min)     │─▶ push, cleanup, batch
+                         └───────────────────────┘
+
+   S3 upload  ──────────▶│ s3trigger              │─▶ image/video conversion
+                         └───────────────────────┘
+
+   ws client  ──────────▶│ websocket_receiver    │
+                         └───────────────────────┘
+
+   public site ─────────▶│ land (API Gateway)    │─▶ unauthenticated reads
+                         └───────────────────────┘
+```
+
+Why split the user-facing Lambda from a worker Lambda? Two reasons:
+
+1. **IAM blast radius.** The worker may need broader DynamoDB write permissions or longer execution timeouts. Splitting keeps the user-facing function least-privileged.
+2. **Cold start and memory profile.** A worker that processes video needs ffmpeg and 1–2GB of memory. The user API needs neither and benefits from a smaller image and faster start.
+
+## The directory layout
+
+Every Lambda app gets one top-level directory:
+
+```
+myproject/
+├── api.py                   # shared singleton AWS clients
+├── config.py
+├── errs.py
+├── build_keeper.py
+├── Dockerfile.main          # one Dockerfile per Lambda flavor (optional)
+├── Dockerfile.sqs
+├── buildspec-dev.yml
+├── buildspec-prod.yml
+├── aws_iam_policy_dev.json
+├── aws_iam_policy_prod.json
+├── main/
+│   ├── aws_handler.py       # Lambda entrypoint
+│   ├── controller/          # @controller functions
+│   ├── service/             # business logic
+│   ├── dao/                 # data-access helpers (heavy queries, aggregations)
+│   ├── model/               # DynamoModel definitions
+│   ├── dto/                 # Pydantic input/output schemas if you need them
+│   ├── constant/            # enums, literal collections
+│   ├── migration/           # one-shot data migrations
+│   └── doc_maker.py
+├── admin/
+│   ├── aws_handler.py
+│   ├── controller/
+│   ├── service/
+│   ├── model/
+│   └── doc_maker.py
+├── queue_receiver/
+│   ├── aws_handler.py
+│   └── controller/
+├── scheduler/
+│   ├── aws_handler.py
+│   └── controller/
+├── webhook_receiver/
+├── websocket_receiver/
+├── s3trigger/
+├── land/
+├── common/                  # cross-app code that doesn't belong in any one Lambda
+├── shared/                  # utility wrappers (slack, push, sms wrappers, etc.)
+└── converter/               # any non-Lambda code (CLI tools, etc.)
+```
+
+Each Lambda directory shares the same four sub-folders (`controller`, `service`, `model`, optionally `dao`). The roles:
+
+| Folder | Responsibility |
+|---|---|
+| `controller/` | Functions decorated with `@controller`. Receive request fields, raise `AppError`, return a result dict. No I/O if possible — delegate to `service/`. |
+| `service/` | Business logic. Orchestrates models and external services. Functions, not classes. |
+| `dao/` | Heavy queries, batch operations, aggregations. Anything where the data shape doesn't fit cleanly inside one model. |
+| `model/` | `DynamoModel` subclasses + their classmethods. Schema lives here. |
+
+## Sharing code between Lambdas
+
+`api.py`, `config.py`, `errs.py`, `build_keeper.py`, and the `shared/` + `common/` directories are imported by every Lambda. That works because **all Lambdas share the same Docker image source** — `awsi` does not split your codebase, it just generates many `aws_handler.py` entrypoints.
+
+A `main` Lambda may depend on something in `admin/`? Don't. Code that needs to be shared belongs in `shared/` or `common/`. Keep the per-Lambda directories self-contained.
+
+A model defined in `main/model/event.py` can be read from `queue_receiver/` though — same code base, same Python module. The reason is the worker often acts **on** main's data and shouldn't need its own duplicate model.
+
+## Per-Lambda `aws_handler.py` differences
+
+All handlers extract from `event`, but the extraction is trigger-specific:
+
+```python
+# main/aws_handler.py — API Gateway
+body = handler_util.get_body(event, context)
+headers = handler_util.get_headers(event, context)
+
+# queue_receiver/aws_handler.py — SQS
+for record in event['Records']:
+    msg = json.loads(record['body'])
+    cmd, body = msg['type'], msg['body']
+
+# scheduler/aws_handler.py — EventBridge
+# event is essentially empty; use ScheduledTask
+
+# websocket_receiver/aws_handler.py — WebSocket
+route_key = event['requestContext']['routeKey']
+connection_id = event['requestContext']['connectionId']
+
+# s3trigger/aws_handler.py — S3 event
+for record in event['Records']:
+    key = record['s3']['object']['key']
+
+# webhook_receiver/aws_handler.py — HTTPS POST
+cmd = event['queryStringParameters']['cmd']
+body = handler_util.get_body(event, context)
+```
+
+The full per-trigger walkthrough is in [Triggers](/docs/handlers/triggers).
+
+## `common/`, `shared/`, `converter/`
+
+| Folder | What it holds |
+|---|---|
+| `common/` | Project-specific logic shared across apps (e.g. shared image generation, statistics calculations). Imports from `api.py`. |
+| `shared/` | Wrappers around third-party services not covered by `sawsi.aws.*` — Firebase push, Slack webhook, ppurio SMS, KakaoTalk API, etc. Each is a small module exposing simple functions. |
+| `converter/` | Non-Lambda code: CLI tools, one-off scripts, internal utilities. |
+
+Putting them at the top level (instead of inside one app) makes the dependency direction explicit: apps depend on `common/`/`shared/`, never the other way around.
+
+## When *not* to split
+
+Adding a Lambda has costs: another `aws_handler.py`, another buildspec entry, another IAM ARN, another item in the `LAMBDAS` JSON array. Don't split until you have a reason. The reasons that justify a split:
+
+- A second trigger source (you got an SQS need).
+- A 10× different memory/timeout profile (video processing).
+- A meaningfully different IAM perimeter (admin vs. user).
+- A clear bounded context that won't share models with the rest of the project.
+
+If the new code is just "more endpoints" with the same trigger and profile, add controllers, not Lambdas.
+
+## Build outputs
+
+The container-image deploy path builds one image per Dockerfile and updates **N** Lambda functions per buildspec post_build. The `LAMBDAS` JSON array in your buildspec lists which Lambda functions get which image:
+
+```json
+[
+  {"name": "dev_myproject_main_docker",         "handler": "main.aws_handler.handler",          "image": "main", "memory": 1800},
+  {"name": "dev_myproject_admin_docker",        "handler": "admin.aws_handler.handler",         "image": "main", "memory": 1024},
+  {"name": "dev_myproject_queue_receiver",      "handler": "queue_receiver.aws_handler.handler", "image": "sqs",  "memory": 2048},
+  {"name": "dev_myproject_scheduler",           "handler": "scheduler.aws_handler.handler",      "image": "main", "memory": 1024},
+  {"name": "dev_myproject_s3trigger",           "handler": "s3trigger.aws_handler.handler",      "image": "sqs",  "memory": 2048},
+  {"name": "dev_myproject_websocket_receiver",  "handler": "websocket_receiver.aws_handler.handler", "image": "main", "memory": 512},
+  {"name": "dev_myproject_webhook_receiver",    "handler": "webhook_receiver.aws_handler.handler", "image": "main", "memory": 512}
+]
+```
+
+The `main` image is used by API-Gateway-style functions; the `sqs` image (with ffmpeg, larger dependencies) is used by workers. See [Deployment](/docs/deployment/deployment) for the buildspec details.
+
+## Next
+
+- [Deployment](/docs/deployment/deployment) — how all these Lambdas get shipped from one push.
+- [IAM](/docs/deployment/iam) — granting only what each Lambda needs.
+- [Triggers](/docs/handlers/triggers) — per-trigger event shapes.

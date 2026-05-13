@@ -1,0 +1,230 @@
+---
+title: AWS service wrappers
+description: S3, SQS, SES, SMS, Locking, Firehose, SecretsManager, and friends — uniform classes behind api.py.
+---
+
+Every AWS service used through sawsi is exposed as a `*API` class under `sawsi.aws.<service>.api`. They share a uniform shape — constructor takes the resource identifier and region, methods are direct verbs (`upload_file`, `send_message`, `get_secret_value`) — and they all live inside `api.py` wrapped in `LazyLoadedAPI`.
+
+This page is the reference for each wrapper: what it is, how to declare it in `api.py`, what it does at init time, and the gotchas to know.
+
+## The api.py pattern
+
+Every wrapper goes into `api.py` exactly once:
+
+```python title="api.py"
+from sawsi.aws.dynamodb.api import DynamoDBAPI
+from sawsi.aws.s3.api import S3API
+from sawsi.aws.locking.api import LockingAPI
+from sawsi.aws.firehose.api import Firehose
+from sawsi.aws.ses.api import SESAPI
+from sawsi.aws.sqs.api import SQSAPI
+from sawsi.aws.sms.api import SMSAPI
+from sawsi.aws.secrets_manager.api import SecretManagerAPI
+from sawsi.aws.apigateway.api import APIGatewayManagement
+from sawsi.shared.class_util import LazyLoadedAPI
+import config
+
+env = config.env
+project_name = 'myproject'
+region = config.region
+
+dynamo:         DynamoDBAPI         = LazyLoadedAPI(DynamoDBAPI,         f'{env}-{project_name}',                                                              region=region)
+s3_public:      S3API               = LazyLoadedAPI(S3API,               f'{env}-{project_name}-public',                                                       region=region)
+s3_uploads:     S3API               = LazyLoadedAPI(S3API,               f'{env}-{project_name}-uploads',                                                      region=region)
+locking:        LockingAPI          = LazyLoadedAPI(LockingAPI,          f'{env}-{project_name}-locking',                                                      region=region)
+firehose_log:   Firehose            = LazyLoadedAPI(Firehose,            f'{env}-{project_name}', f'{env}-{project_name}-firehose-log', 'log',                 region=region)
+ses:            SESAPI              = LazyLoadedAPI(SESAPI,              region=region)
+sqs:            SQSAPI              = LazyLoadedAPI(SQSAPI,              f'https://sqs.{region}.amazonaws.com/<account>/{env}_{project_name}_queue',           region=region)
+sms:            SMSAPI              = LazyLoadedAPI(SMSAPI,              region_name='us-east-1')   # SMS only ships from us-east-1
+secret_manager: SecretManagerAPI    = LazyLoadedAPI(SecretManagerAPI,    f'{env}/{project_name}',                                                              region=region)
+apigw:          APIGatewayManagement= LazyLoadedAPI(APIGatewayManagement, endpoint_url='https://<api-id>.execute-api.<region>.amazonaws.com/<stage>',          region=region)
+```
+
+The type annotation uses the wrapped class so your IDE gets full autocomplete; the runtime value is a `LazyLoadedAPI` that forwards attribute access.
+
+## S3 — `S3API`
+
+```python
+s3_public.init_s3_bucket(acl='public-read')     # in build_keeper.py
+s3_public.upload_file(local_path, object_key, content_type='image/webp', acl='public-read')
+url = s3_public.upload_file_and_return_url(bytes_or_path, ext='webp', content_type='image/webp')
+s3_public.download_file(object_key, local_path)
+s3_public.create_presigned_url_put_object(object_key, expires_in=3600)
+```
+
+Conventions:
+
+- **Separate buckets for public vs. private.** Public buckets hold web-readable assets (avatars, generated thumbnails); private buckets hold user uploads before processing.
+- **`init_s3_bucket(acl='public-read')` once, in `build_keeper.py`.** The function is idempotent.
+- **Presigned URLs are short-lived.** Generate per request, don't cache.
+
+## SQS — `SQSAPI`
+
+```python
+api.sqs.send_message(json.dumps({'type': 'queue_receiver.controller.x.y', 'body': {...}}))
+```
+
+The wrapper holds a fixed `queue_url` per instance. If you need to write to a second queue, declare a second `LazyLoadedAPI(SQSAPI, other_url, ...)`. Receiving is done by the queue Lambda's `aws_handler.py` reading from `event['Records']`.
+
+## SES — `SESAPI`
+
+```python
+api.ses.send_email(
+    sender='no-reply@mydomain.com',
+    recipient='user@example.com',
+    subject='Welcome',
+    body_text='Plain text body',
+    body_html='<html>...</html>',
+)
+```
+
+Pre-requisite: the sender domain (or each sender email) must be **verified in SES**. SES out of the sandbox is a separate AWS support request.
+
+## SMS — `SMSAPI`
+
+```python
+api.sms.send_sms(phone_number='+82-10-...', message='Code: 123456')
+```
+
+Implemented over SNS Transactional SMS, which is only available in `us-east-1`. Declare the wrapper with `region_name='us-east-1'` regardless of the rest of your project's region.
+
+International SMS routing and price caps are AWS-account-level settings — configure them once.
+
+## Locking — `LockingAPI`
+
+A DynamoDB-backed distributed lock with a context-manager API.
+
+```python
+# api.py
+locking = LazyLoadedAPI(LockingAPI, f'{env}-{project}-locking', region=region)
+
+# build_keeper.py
+api.locking.init_table()
+
+# in code
+with api.locking.lock('register_phone_+82-10-1234-5678', max_alive_ts=30, max_retries=3, wait_time=2):
+    do_critical_section()
+```
+
+If the lock can't be acquired within `max_retries × wait_time` seconds, the context manager raises `RuntimeError`. Translate to an `AppError` if the caller is user-facing:
+
+```python
+try:
+    with api.locking.lock(...):
+        ...
+except RuntimeError:
+    raise errs.lock_busy
+```
+
+## Firehose — `Firehose`
+
+For structured logging into S3 via Kinesis Firehose.
+
+```python
+# api.py
+firehose_log = LazyLoadedAPI(Firehose, stream_name, bucket_name, key_prefix, region=region)
+
+# build_keeper.py
+api.firehose_log.init()         # creates stream + IAM role, then sleeps ~4s
+                                # for IAM propagation
+
+# in code (hot path)
+api.firehose_log.put_record(json.dumps({...}))
+
+# later, reading back
+for log, key in api.firehose_log.generate_log_json_list_and_key(key_start_after=cursor):
+    process(log)
+```
+
+The 4-second sleep in `init()` is **not optional** — IAM role propagation is eventually consistent and the first `put_record` after creation will fail without it.
+
+Records are buffered by Firehose for up to 5 minutes before landing in S3 — do not try to read back records you just wrote.
+
+## SecretsManager — `SecretManagerAPI`
+
+```python
+secret_manager = LazyLoadedAPI(SecretManagerAPI, f'{env}/{project}', region=region)
+
+key = api.secret_manager.get_secret_value('open_ai_secret_key')
+```
+
+The wrapper caches the **decrypted secret value** in memory after the first read. This matters two ways:
+
+- **Cheap.** KMS decryption is billed per request; the cache saves money on hot paths.
+- **Stale after rotation.** Rotating a secret in AWS does not invalidate the Lambda container's cache. The next cold start picks up the new value; existing warm containers keep using the old value until they recycle (minutes to hours).
+
+If immediate rotation matters, redeploy to force-recycle containers.
+
+## API Gateway Management — `APIGatewayManagement`
+
+WebSocket push from any Lambda back to a connected client.
+
+```python
+apigw = LazyLoadedAPI(APIGatewayManagement, endpoint_url='https://<ws-api-id>.execute-api.<region>.amazonaws.com/<stage>', region=region)
+
+api.apigw.post_to_connection(data=json.dumps({...}), connection_id=conn_id)
+```
+
+The endpoint URL is **per-environment** — your dev WebSocket API has a different `execute-api` host than prod. Hard-coding it in `api.py` like this is fine; just wrap in an `if env == 'prod'` if needed.
+
+## SNS — `SNSAPI`
+
+```python
+api.sns.send_message(topic_arn, message)
+```
+
+Use for pub/sub fan-out. SMS is a special case shipped as a separate `SMSAPI`.
+
+## SSM — `SSMAPI`
+
+```python
+api.ssm.run_commands(instance_id, ['systemctl restart my-service'])
+```
+
+For controlling EC2 instances from Lambda. Rare in a fully-serverless setup.
+
+## Lambda client — `LambdaAPI`
+
+```python
+api.lambda_client.invoke(function_name, payload)
+api.lambda_client.create_event_source_mapping(function_name, event_source_arn, ...)
+api.lambda_client.update_lambda_code(function_name, s3_bucket, s3_key, publish=False)
+```
+
+Most projects use this for cross-function synchronous invocation (when SQS is too async) and for self-managed deploy scripts.
+
+## CloudWatch Logs — `LogsAPI`
+
+```python
+events = api.logs.get_log_events(log_group_name, log_stream_name)
+```
+
+Useful for admin tooling that reads from your own functions' logs.
+
+## OpenSearch — `OpenSearchAPI`
+
+```python
+api.opensearch.run('POST', '/myindex/_search', body={'query': {'match_all': {}}})
+api.opensearch.put_document('myindex', doc_id, document)
+```
+
+SigV4-signed HTTP requests against an OpenSearch domain. Bring your own index/mapping.
+
+## Bedrock — `BedrockAPI`
+
+```python
+resp = api.bedrock.converse(
+    model_id='anthropic.claude-haiku-4-5-20251001',
+    messages=[{'role': 'user', 'content': [{'text': 'hello'}]}],
+    system='You are a helpful assistant.',
+    max_tokens=512,
+)
+```
+
+Both the high-level `converse()` (recommended) and low-level `invoke_model()` are available. See the [AI / Vector / Search](/docs/services/ai-vector-search) chapter for the Vector KB and SearchEngine stories.
+
+## What to read next
+
+- [AI / Vector / Search](/docs/services/ai-vector-search) — Bedrock, OpenSearch, S3Vector, VectorKB, SearchEngine.
+- [Background workers & scheduling](/docs/services/background-scheduling) — SQS, EventBridge, Locking.
+- [IAM policies](/docs/deployment/iam) — what permissions each wrapper actually needs.

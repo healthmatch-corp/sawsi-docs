@@ -1,0 +1,177 @@
+---
+title: 보안 자세
+description: 라우팅, 세션, 시크릿, IAM, traceback, GSI NULL 함정까지 통합 체크리스트로 알려드려요.
+---
+
+이 페이지는 sawsi 프로젝트의 통합 보안 체크리스트예요. 대부분 항목은 다른 챕터에서 상세히 다뤄요 — 이 페이지는 감사 시점의 뷰예요.
+
+## 라우팅 경계
+
+- `allowed_cmd_prefixes`가 **유일한** 라우팅 보안 게이트예요. 절대 비우거나 `['*']`로 두지 말아 주세요.
+- 사용자 대면 람다는 `<app>.controller.*`만 허용해 주세요. 어드민 람다는 `admin.controller.*`만 허용해 주세요. 절대 겹치지 않게 해 주세요.
+- 웹훅 수신기는 더 좁혀 주세요 — 예상 provider와 매칭되는 cmd만요.
+
+[요청 라이프사이클](/docs/handlers/request-lifecycle) 참고해 주세요.
+
+## 세션과 OTP
+
+- 세션 id만으로는 **불충분해요** — `use_secure=True`일 때 `o_c`(요청당 OTP 코드)와 짝지어 주세요.
+- `otp_secret`은 로그인 시 클라이언트에 **1회**만 전송되고, 다시 echo하지 않아요.
+- 세션이 `ts_offset`을 저장해서 OTP 윈도우가 클라이언트 시계 어긋남을 허용해요.
+- 유출된 세션 id가 `otp_secret` 없이는 쓸모없고, 캡처된 `o_c`는 45초 후 쓸모없어요.
+
+[세션](/docs/auth/sessions) 참고해 주세요.
+
+## OAuth
+
+- 사용자 매칭은 `social_id`(`sub`)로 해주세요 — 이메일로는 절대 안 돼요.
+- register 컨트롤러 안에서 `id_token`을 **재검증**해 주세요 — 로그인 응답을 신뢰하지 말아 주세요.
+- Apple bundle id 리스트가 dev와 prod id 모두 포함되어 있어야 해요.
+- Google `email_verified`는 문자열 `'true'`예요, boolean 아니에요.
+
+[OAuth & 소셜 로그인](/docs/auth/oauth) 참고해 주세요.
+
+## 어드민
+
+- 어드민은 `allowed_cmd_prefixes=['admin.controller']`로 별도 람다에 거주해요.
+- 비-`root`/`master` 접근은 `AdminGroup.allow_cmds` × `allow_ips`로 게이트돼요.
+- 파괴적 작업(계정 삭제, purge)은 핸들러에서 독립적으로 게이트해 주세요 — 그룹 규칙 경유는 안 돼요.
+
+[어드민 서브시스템](/docs/auth/admin) 참고해 주세요.
+
+## Sparse GSI / NULL 함정
+
+- GSI 키 필드는 `str = ' '`(한 칸 공백)이에요 — 절대 `Optional[str] = None`은 안 돼요.
+- DynamoDB는 인덱스 필드의 `NULL` 속성을 `ValidationException`으로 거부해요.
+- "설정됨" 확인은 `if field`가 아니라 `field.strip()`로 해주세요.
+
+[DynamoModel](/docs/data/dynamomodel) 참고해 주세요.
+
+## IAM 경계
+
+- 정책의 모든 리소스 ARN이 env prefix로 스코핑돼요.
+- `aws_iam_policy_dev.json`과 `aws_iam_policy_prod.json`이 env 토큰에서만 달라야 해요.
+- 권한 변경 시 둘 다 같은 커밋에 갱신해 주세요.
+- CodeBuild 서비스 역할 ≠ 람다 실행 역할이에요. 혼동하면 안 돼요.
+
+[IAM](/docs/deployment/iam) 참고해 주세요.
+
+## 시크릿
+
+- 모든 시크릿이 Secrets Manager의 `{env}/{project}`에 거주해요 — 소스에는 절대 안 돼요.
+- `SecretManagerAPI` 인스턴스가 값을 캐시해요 — 캐시 무효화는 컨테이너 재활용을 요구해요.
+- AWS의 시크릿 회전이 warm 람다 컨테이너를 재활용 전까지 무효화하지 않아요.
+
+[AWS 서비스 래퍼](/docs/services/aws-wrappers)와 [지연 초기화](/docs/deployment/lazy-loading) 참고해 주세요.
+
+## 응답 모양
+
+- prod에선 `use_traceback=False`예요. Traceback이 파일 경로, 라인 번호, 변수 이름을 노출해요.
+- 애플리케이션 에러 코드는 `B10000`+에서 시작하거나 라이브러리 코드(`B0xxxx`)와 충돌 없는 카테고리 prefix를 써 주세요.
+- `rslt_msg`는 영어식 안정 식별자예요 — 클라이언트에서 로컬라이즈해 주세요.
+
+[에러 & 결과 코드](/docs/architecture/errors) 참고해 주세요.
+
+## 웹훅
+
+- 파싱 전에 **raw body 서명**을 검증해 주세요. 래퍼가 `event['body']`를 문자열로 줘요 — 검증용으로 보관해 주세요.
+- Provider별 시크릿(HMAC 키, JWT 공개키)이 Secrets Manager에 거주해요.
+- 모든 요청에서 재검증해 주세요 — "신뢰된 소스" 상태를 절대 캐시하지 말아 주세요.
+
+[트리거 — 웹훅 수신기](/docs/handlers/triggers) 참고해 주세요.
+
+## 입력 검증
+
+- 컨트롤러 시그니처의 Pydantic 타입이 구문 검증을 자동 처리해요.
+- 의미 검증(유일성, 범위, 포맷)은 컨트롤러에서 해 주세요 — 실패 시 `AppError`를 raise해 주세요.
+- 전화번호는 유일성 검사 **전에** 정규화해 주세요 (`phone_util.normalize_phone_number`).
+
+## 레이트 제한
+
+- 전화당 비밀번호 재시도 카운터예요 — 윈도우 안에서 5회 실패 시 차단돼요.
+- OAuth register는 동시 중복 사용자 생성을 막기 위해 `social_id`별로 잠금해요.
+- 고트래픽 공개 엔드포인트(검색, 자동완성)는 API Gateway throttling 뒤에 위치해 주세요.
+
+## 감사 로깅
+
+- 어드민 액션이 `(admin_id, cmd, body, ts)`로 Firehose에 로깅돼요.
+- 사용자 레벨 감사 이벤트(비밀번호 변경, OAuth 연결해제, 계정 삭제)도 같은 패턴을 따라요.
+
+[옵저버빌리티](/docs/architecture/observability) 참고해 주세요.
+
+## 람다별 동시성
+
+- 임계적 사용자 대면 람다는 시끄러운 워커에 의해 굶지 않도록 Reserved Concurrency를 보유해 주세요.
+- 어드민 람다는 자체 동시성 캡을 보유해 주세요 — 어드민 볼륨이 낮으므로 보통 작아요.
+
+## 콜드스타트 표면
+
+- `api.py`는 import 시 AWS 작업을 하지 않아요 — 모든 래퍼가 `LazyLoadedAPI`예요.
+- 모듈 최상위에서 AWS 호출 금지예요 (`ALLOWED_IPS = api.secret_manager.get_secret_value(...)`는 잘못된 예예요).
+- prod에서 쫓기 전에 dev에서 콜드스타트 프로파일해 주세요.
+
+## 이 리스트의 *바깥*
+
+sawsi 컨벤션이 다루지 않는 것들이에요:
+
+- API Gateway의 WAF 구성 (엣지 레이트 제한).
+- VPC 통합 (대부분 sawsi 프로젝트는 단순함을 위해 비-VPC).
+- DDoS 보호 (Shield Standard는 기본 활성; Advanced는 조직 레벨 결정).
+- 크로스 리전 복제와 재해 복구.
+- Firehose 너머의 감사 트레일 (계정 레벨의 CloudTrail).
+
+이는 실제 우려지만 프레임워크 특정은 아니에요. AWS 계정 레이어에서 추가해 주세요.
+
+## 출시 전 감사 체크리스트
+
+prod 트래픽을 켜기 전 한 페이지로 정리했어요:
+
+```
+라우팅
+[ ] allowed_cmd_prefixes가 비어 있지 않고, 와일드카드가 아니며, 람다별로 설정
+[ ] 어드민과 사용자 람다가 분리된 prefix
+[ ] 세션 없음 화이트리스트가 작고 명시적
+
+세션
+[ ] 모든 새 세션이 _create_user_session_secure 사용 (레거시 X)
+[ ] 새 세션에 use_secure=True
+[ ] OTP 윈도우가 예상 클라이언트 시계 어긋남 커버
+
+OAUTH
+[ ] 각 provider가 이메일이 아니라 social_id로 매칭
+[ ] register 컨트롤러가 id_token 재검증
+[ ] Apple bundle id가 dev와 prod 포함
+
+어드민
+[ ] AdminGroup 화이트리스트가 각 매니저에 대해 채워짐
+[ ] root/master 계정이 운영 팀에 한정
+[ ] ROOT_ONLY_CMDS 리스트가 핸들러에서 게이트
+
+데이터
+[ ] 어떤 GSI 키 필드에도 Optional[str] = None 없음
+[ ] 모든 sparse 필드가 ' ' 기본값 + .strip() 검사
+[ ] 사용자 대면 경로에 FilterExpression 없음
+
+IAM
+[ ] dev와 prod 정책이 구조에서 일치
+[ ] 노출 와일드카드 리소스 없음
+[ ] 서비스별 권한이 api.py가 실제 사용하는 것과 일치
+
+시크릿
+[ ] 소스에 하드코딩된 시크릿 없음
+[ ] 모든 시크릿 경로가 {env}/{project} 따름
+[ ] 회전이 자동화돼 있다면 CodeBuild 역할이 Secrets에 쓰기 가능
+
+배포
+[ ] prod 핸들러에서 use_traceback=False
+[ ] 애플리케이션 에러 코드가 A/U/B0xxxx와 겹치지 않음
+[ ] error_receiver가 실제 알림 채널에 연결됨
+[ ] 두 buildspec-{env}.yml 파일이 일치하는 LAMBDAS 배열을 가짐
+
+옵저버빌리티
+[ ] 비즈니스 이벤트용 Firehose 스트림 초기화됨
+[ ] 에러율과 지연에 CloudWatch alarm 설정
+[ ] 로그에 콜드스타트 메트릭 포함
+```
+
+이 리스트는 의도적으로 짧아요. 각 항목이 완전히 다뤄지는 챕터로 링크해 두었어요.

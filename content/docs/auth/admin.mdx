@@ -1,0 +1,170 @@
+---
+title: Admin sub-system
+description: Separate Lambda, separate auth, group-scoped command and IP whitelisting.
+---
+
+The admin surface of a sawsi project is intentionally separate from the user surface: a separate Lambda function, a separate model for admins, a separate permission model, and a separate set of `cmd` prefixes. This isolation costs you one extra Lambda but buys you a clean security boundary.
+
+## Why split
+
+Two reasons to make admin its own Lambda rather than a flag on the user Lambda:
+
+- **IAM blast radius.** The admin function often needs broader permissions (write to any user, run analytics scans). Giving the user function those permissions and gating in code is a single-mistake-from-disaster setup.
+- **Cmd surface.** `admin.controller.*` is a completely different routing prefix. The user Lambda's `allowed_cmd_prefixes` excludes admin, so even a misconfigured client can't reach an admin endpoint.
+
+## The models
+
+```python title="admin/model/admin_manager.py"
+@sync
+class AdminManager(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'admin_manager'
+    _indexes = [('phone', 'crt')]
+
+    name: str
+    birth: str
+    phone: str
+    group: Literal['root', 'master', 'manager']
+    password_hash: str
+    password_salt: str
+
+    @classmethod
+    def get_by_phone(cls, phone):
+        items, _ = cls.query(pk_field='phone', pk_value=phone, sk_field='crt', limit=1, reverse=True)
+        return items[0] if items else None
+```
+
+```python title="admin/model/admin_group.py"
+@sync
+class AdminGroup(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'admin_group'
+
+    name: str
+    admin_manager_ids: list[str] = []
+    allow_cmds: list[str] = []     # explicit cmd whitelist, or ['*'] for all
+    allow_menus: list[str] = []    # UI menu visibility (consumed by frontend)
+    allow_ips: list[str] = []      # IP whitelist, or ['*']
+```
+
+Three group levels:
+
+| Group | Behavior |
+|---|---|
+| `root` | Unconditional access. One or two human operators. |
+| `master` | Unconditional access. Typically the engineering team. |
+| `manager` | Permission resolved by group membership: cmd whitelist + IP whitelist. |
+
+The unconditional groups exist for emergencies — if you lock yourself out of the granular system, `root`/`master` still works.
+
+## The handler
+
+The admin Lambda runs three checks in order: session, group, IP, and only then dispatches.
+
+```python title="admin/aws_handler.py"
+NO_SESSION_CMDS = {
+    'admin.controller.admin_auth.send_sms_auth_code',
+    'admin.controller.admin_auth.get_sms_auth_token',
+    'admin.controller.admin_member.login',
+}
+
+@handler_util.aws_handler_wrapper(use_traceback=True)    # use_traceback OK for admin
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+    source_ip = handler_util.get_source_ip(event, context)
+    cmd = body.get('cmd')
+
+    sid = headers.get('session_id')
+    if not sid and cmd not in NO_SESSION_CMDS:
+        raise errs.no_session
+
+    me = None
+    if sid:
+        me = _get_admin_me(sid)                 # AdminManager
+        body['me'] = me
+
+    # Group + IP gate, unless cmd is no-session
+    if cmd not in NO_SESSION_CMDS:
+        if me.group not in ('root', 'master'):
+            if not admin_group_service.can_access_cmd(me.id, cmd, source_ip):
+                raise errs.permission_denied
+
+    # Extra gate for destructive ops
+    if cmd in ROOT_ONLY_CMDS and me.group != 'root':
+        raise errs.permission_denied
+
+    return router(cmd, body, headers, allowed_cmd_prefixes=['admin.controller'])
+```
+
+`can_access_cmd` reads the manager's groups and returns True only if **at least one** group has both the cmd in `allow_cmds` (or `'*'`) and the IP in `allow_ips` (or `'*'`).
+
+```python title="admin/service/admin_group_service.py"
+def can_access_cmd(admin_manager_id, cmd, source_ip):
+    groups = _all_admin_groups()
+    groups = [g for g in groups if admin_manager_id in g.admin_manager_ids]
+    for group in groups:
+        ip_ok = source_ip in group.allow_ips or '*' in group.allow_ips
+        cmd_ok = cmd in group.allow_cmds or '*' in group.allow_cmds
+        if ip_ok and cmd_ok:
+            return True
+    return False
+```
+
+## Auto-listing admin cmds
+
+To populate `allow_cmds` choices in the admin UI itself, sawsi ships an AST helper that walks the controller directory and emits every `cmd` string:
+
+```python title="path_util.py (project root)"
+import ast, os, pkgutil
+
+def extract_admin_cmds_from_controller():
+    cmds = []
+    base = 'admin/controller'
+    for root, _, files in os.walk(base):
+        for fname in files:
+            if not fname.endswith('.py'):
+                continue
+            module_path = root.replace('/', '.') + '.' + fname[:-3]
+            tree = ast.parse(open(os.path.join(root, fname)).read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    if any(
+                        isinstance(d, ast.Name) and d.id == 'controller'
+                        for d in node.decorator_list
+                    ):
+                        cmds.append(f'{module_path}.{node.name}')
+    return cmds
+```
+
+Then expose a cmd that returns the list, and the admin UI shows checkboxes for every controller.
+
+## Common patterns
+
+### Destructive ops only for root
+
+```python
+ROOT_ONLY_CMDS = {
+    'admin.controller.admin_member.create_admin',
+    'admin.controller.admin_member.delete_admin',
+    'admin.controller.system.purge_user',
+}
+```
+
+Gate them explicitly in the handler — don't rely on group rules. A single misconfigured group should not enable account deletion.
+
+### Audit logging
+
+Use Firehose: `api.firehose_log.put_record(json.dumps({'admin_id': me.id, 'cmd': cmd, 'body': body, 'ts': time.time()}))` after the controller returns. Persisted to S3 by Firehose.
+
+### Doc maker for the admin
+
+The admin Lambda usually ships a `doc_maker.py` similar to the user one, but pointed at the admin's API Gateway URL. The result is a Swagger that lists every admin endpoint — extremely useful for non-engineer operators.
+
+## What this is **not**
+
+- Not a full RBAC system. There are no roles-on-objects (e.g. "manager X owns event Y"). The system is cmd × IP, nothing more.
+- Not an OIDC integration. Admins log in by phone + password + SMS code. If you want SSO, write it on top.
+- Not multi-tenant. The system assumes a small set of admins, all operating on the same data plane.
+
+If you outgrow these limits, the upgrade path is usually a separate IAM-backed admin product, not an extension of this system.

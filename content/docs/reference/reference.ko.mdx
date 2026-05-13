@@ -1,0 +1,196 @@
+---
+title: API 레퍼런스
+description: 모듈, 클래스, 환경변수, 응답 코드, 용어집을 한눈에 보여 드려요.
+---
+
+이 페이지가 한눈에 보는 레퍼런스예요. 산문 설명이 필요하면 크로스 링크를 따라가 주세요.
+
+## `sawsi.handler`
+
+| 심볼 | 설명 |
+|---|---|
+| `controller_decorator.controller(func)` | 데코레이터예요. `func`를 `controller_registry`에 `module.func_name`로 등록해요. |
+| `controller_decorator.controller_registry` | `module.func_name → func` dict예요. import으로 채워져요. |
+| `router.router(cmd, body, headers, allowed_cmd_prefixes)` | prefix 검증과 시그니처 주입으로 디스패치해요. |
+
+## `sawsi.model`
+
+| 심볼 | 설명 |
+|---|---|
+| `base.DynamoModel` | Pydantic 기반 ORM 베이스 클래스예요. |
+| `base.sync` | 데코레이터예요. 클래스를 `__models_to_sync__`에 추가해요. |
+| `base.sync_all_models(packages: list[str])` | 패키지를 import하고, 모든 `@sync` 클래스에 `sync_table()`을 호출해요. 24개 병렬 스레드로 돌아가요. |
+| `base.extract_dynamodb_type(annotation)` | Pydantic 타입 어노테이션을 DynamoDB 속성 타입(`S`, `N`, `B` 등)에 매핑해요. |
+
+### `DynamoModel` 인스턴스 메서드
+
+| 메서드 | 설명 |
+|---|---|
+| `.put(can_overwrite=False)` | 삽입해요. 중복 id면 덮어쓰기를 허용하지 않는 한 raise해요. |
+| `.update(force_update_default_fields=False)` | 변경된 속성만 갱신해요 (아무것도 안 바뀌면 NoOp이에요). |
+| `.delete()` | id로 삭제해요. |
+| `.get_attributes_to_update()` | 로드 이후 변경된 속성 이름 리스트를 반환해요. |
+
+### `DynamoModel` 클래스 메서드
+
+| 메서드 | 설명 |
+|---|---|
+| `.get(id, consistent_read=True, use_cache=False)` | 한 row를 조회해요. |
+| `.batch_get(ids, consistent_read=True)` | 병렬로 여러 개를 조회해요. |
+| `.query(pk_field, pk_value, sk_condition, sk_field, sk_value, ..., start_key, limit)` | `(items, end_key)`를 반환해요. |
+| `.generate(pk_field, pk_value, ...)` | query와 동일하지만 아이템을 하나씩 yield해요. |
+| `.scan(start_key, limit, filter_expression)` | 전체 테이블을 스캔해요. 핫패스에서는 피해 주세요. |
+| `.sync_table(create_default_index=True)` | 누락 시 테이블과 GSI를 생성해요. |
+
+## `sawsi.aws.<service>.api`
+
+| 서비스 | 클래스 | 생성 |
+|---|---|---|
+| DynamoDB | `DynamoDBAPI` | `(group_name, region, credentials=None)` |
+| S3 | `S3API` | `(bucket_name, region, credentials=None)` |
+| Locking | `LockingAPI` | `(table_name, region, credentials=None)` |
+| Firehose | `Firehose` | `(stream_name, bucket_name, key_prefix, region)` |
+| SES | `SESAPI` | `(region, credentials=None)` |
+| SMS | `SMSAPI` | `(region_name='us-east-1', credentials=None)` |
+| SQS | `SQSAPI` | `(queue_url, region, credentials=None)` |
+| SecretsManager | `SecretManagerAPI` | `(secret_name, region, credentials=None)` |
+| API Gateway Mgmt | `APIGatewayManagement` | `(endpoint_url, region, credentials=None)` |
+| SNS | `SNSAPI` | `(region, credentials=None)` |
+| SSM | `SSMAPI` | `(region, credentials=None)` |
+| Lambda | `LambdaAPI` | `(region, credentials=None)` |
+| Logs | `LogsAPI` | `(region, credentials=None)` |
+| Cognito | `CognitoAPI` | `(region, credentials=None)` |
+| Bedrock | `BedrockAPI` | `(region, credentials=None)` |
+| OpenSearch | `OpenSearchAPI` | `(host, region, credentials=None)` |
+| S3 DB | `S3DBAPI` | `(bucket_name, table_name, region, credentials=None)` |
+| S3 Vector | `S3VectorAPI` | `(bucket_name, region, credentials=None)` |
+| Vector KB | `VectorKBAPI` | `(vector_bucket_name, index_name, embed_model_id, dimension, distance_metric, region, credentials=None)` |
+| CodeBuild | `CodeBuildAPI` | `(region, credentials=None)` |
+| CodeCommit | `CodeCommitAPI` | `(region, credentials=None)` |
+| IAM | `IAMAPI` | `(region, credentials=None)` |
+
+## `sawsi.shared`
+
+| 모듈 | 심볼 | 설명 |
+|---|---|---|
+| `handler_util` | `aws_handler_wrapper(error_receiver, content_type, use_traceback, ignore_app_errors)` | 데코레이터 팩토리예요. |
+| `handler_util` | `AWSResponse(body, content_type, status_code, charset)` | API Gateway 응답 빌더예요. |
+| `handler_util` | `get_body(event, context)` | event에서 JSON body를 파싱해요. |
+| `handler_util` | `get_headers(event, context)` | 소문자 헤더 dict를 반환해요. |
+| `handler_util` | `get_source_ip(event, context)` | source IP를 반환해요. |
+| `error_util` | `AppError(code, message)` | 애플리케이션 에러예요. |
+| `error_util` | `SYSTEM_NO_SUCH_CMD` | `AppError('B00001', ...)` |
+| `error_util` | `Command_Prefix_not_allowed` | `AppError('B00006', ...)` |
+| `class_util` | `LazyLoadedAPI(api_class, *args, **kwargs)` | 지연 생성 래퍼예요. |
+| `dict_util` | `convert_number_to_decimal(d)` / `convert_decimal_to_number(d)` | float ↔ Decimal로 변환해요. |
+| `filter_exp_util` | `Exp(field, condition, value)` + `.and_()` / `.or_()` | DynamoDB 필터 표현식 DSL이에요. **드물게 써요.** |
+| `function_util` | `auto_cache`, `synchronized`, `try_run` | 데코레이터 / 헬퍼예요. |
+| `hash_util` | `make_salt()`, `hash_password(plain)`, `validate_password(plain, hash)` | PBKDF2 기반 비밀번호 헬퍼예요. |
+| `list_util` | `divide_chunks(lst, n)` | 청크를 yield하는 제너레이터예요. |
+| `set_util` | `HashableDict(d, keys_to_hash)` | 키 부분집합으로 해시하는 dict예요. |
+| `schedule_util` | `ScheduledTask(cron_expression)` (컨텍스트 매니저) | Cron 매칭 스케줄 헬퍼예요. |
+| `schedule_util` | `join()` | 모든 `ScheduledTask`가 시작한 스레드를 대기해요. |
+| `aws_es_proxy_util` | `install_aws_es_proxy()` | OpenSearch dev용 로컬 헬퍼예요. |
+
+## `sawsi.service`
+
+| 심볼 | 설명 |
+|---|---|
+| `searchengine.SearchEngine(dynamo_db_api, table_name)` | DynamoDB 위에 올린 한글 친화적 n-gram 자동완성 인덱스예요. |
+
+## `sawsi.api_doc`
+
+| 심볼 | 설명 |
+|---|---|
+| `doc_generator.DocMaker(entry_function, base_url, test_function)` | 테스트-as-문서 도구예요. |
+| `doc_generator.APIInfo` | 한 엔드포인트의 기록된 모양에 대한 데이터클래스예요. |
+
+## 환경변수
+
+| 이름 | 설정처 | 읽는 곳 |
+|---|---|---|
+| `env` | 람다 함수 config, Dockerfile `--build-arg` | `config.env` |
+| `AWS_DEFAULT_REGION` | 람다 런타임 / Dockerfile | boto3 기본 |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | 람다 런타임 | boto3 기본 |
+| `LANGSMITH_*`, `OPENAI_API_KEY` 등 | `api.py`가 `secret_manager`에서 가져와요 | 애플리케이션 코드 |
+
+## 보일러플레이트 파일 인벤토리
+
+| 파일 | 역할 |
+|---|---|
+| `api.py` | 모든 AWS 클라이언트용 LazyLoadedAPI 싱글턴이에요. |
+| `config.py` | env를 읽고, region과 build 플래그를 설정해요. |
+| `errs.py` | 프로젝트용 `AppError` 인스턴스예요. |
+| `build_keeper.py` | 배포 시 리소스를 초기화해요. |
+| `requirements.txt` | Python 의존성이에요. |
+| `Dockerfile.main` | API Gateway 스타일 람다용 컨테이너 이미지예요. |
+| `Dockerfile.sqs` | 워커용 컨테이너 이미지예요 (보통 ffmpeg을 포함해요). |
+| `buildspec-{lambda,docker}-{dev,prod}.yml` | CodeBuild 오케스트레이션이에요. |
+| `aws_iam_policy_{dev,prod}.json` | env-prefix로 스코핑된 IAM 정책 템플릿이에요. |
+
+## 응답 코드 한눈에
+
+| 범위 | 의미 | 정의 위치 |
+|---|---|---|
+| `A00000` | 성공 | 래퍼 |
+| `B00xxx` | 라이브러리 에러 | `sawsi.shared.error_util` |
+| `B1xxxx`, `S0001+` 등 | 앱 에러 | `errs.py` |
+| `U99999` | 알 수 없는 예외 | 래퍼 |
+
+## 용어집
+
+| 용어 | 의미 |
+|---|---|
+| **cmd** | 라우팅에 쓰이는 점 분리 import 경로예요: `<app>.controller.<module>.<func>`. |
+| **handler** | `aws_handler.py:handler(event, context)` 함수예요. 람다 진입점이에요. |
+| **controller** | `@controller` 데코레이터를 단 함수예요. 시그니처 주입으로 요청 필드를 받아요. |
+| **service** | 모델과 외부 서비스를 오케스트레이션하는 함수 모듈이에요. |
+| **dao** | 단일 모델을 넘어선 쿼리/집계를 위한 데이터 접근 모듈이에요. |
+| **wrapper** | `sawsi.aws.<service>.api.*API` 클래스예요. 얇은 boto3 래퍼예요. |
+| **sync** | `@sync` 데코레이터 + `sync_all_models()` — DynamoDB 스키마 마이그레이션 진입점이에요. |
+| **u_b** | Universal Bucket — 항상 `'_'`인 자동 필드로, 기본 GSI 파티션 키로 써요. |
+| **rslt_cd** | 최상위 응답 코드예요 (`A00000`, `B*`, `U99999`). |
+| **AppError** | 비즈니스 에러용 프레임워크 예외 타입이에요. |
+| **LazyLoadedAPI** | 첫 속성 접근까지 AWS 클라이언트 생성을 미루는 래퍼예요. |
+| **ScheduledTask** | 스케줄러 람다용 컨텍스트 매니저 기반 cron 매처예요. |
+| **SparseGSI** | 키 필드가 `' '` 기본값을 써서 부재 row가 인덱스에 안 나타나는 GSI예요. |
+
+## FAQ
+
+**Q. 컨테이너 이미지 대신 평범한 `zip`으로 배포할 수 있을까요?**
+A. 보일러플레이트가 그 경로용 `buildspec-lambda-{env}.yml`을 출시해요. 프로젝트 deps가 작으면 써도 돼요. 대부분의 비자명한 프로젝트는 `build_keeper.py`가 빌드 안에서 실행되기 때문에 컨테이너 경로가 더 이득이에요.
+
+**Q. 단일 API Gateway 요청에서 여러 cmd를 실행할 수 있을까요?**
+A. 안 돼요. 요청 1개 = `cmd` 1개 = 컨트롤러 1개예요. 배칭을 원하면 오케스트레이션하는 단일 cmd를 작성하세요.
+
+**Q. 람다 호출 간에 비싼 계산을 캐시하려면 어떻게 해요?**
+A. 모듈 레벨 글로벌이 컨테이너 안에서 살아남아요. 컨테이너 간 캐싱이 필요하면 TTL이 있는 DynamoDB를 쓰세요.
+
+**Q. FastAPI나 다른 프레임워크와 함께 쓸 수 있나요?**
+A. 핸들러는 평범한 Python이라 어디서든 호출 가능해요. 하지만 컨벤션이 람다 진입점을 가정하기 때문에 FastAPI 아래에서 실행하는 건 흔치 않아요.
+
+**Q. 바이너리 업로드(이미지, 비디오)는 어떻게 처리해요?**
+A. presigned S3 PUT URL을 써요 (`api.s3_uploads.create_presigned_url_put_object(key)`) — 클라이언트가 직접 업로드한 뒤 API에 완료를 알려요. 바이너리를 API Gateway로 프록시하지 마세요.
+
+**Q. 스케일에서의 WebSocket은요?**
+A. 각 연결이 `WsConnection`의 row예요. N개 연결에 푸시하려면 순회하면서 `api.apigw.post_to_connection`을 병렬로 호출하세요. 매우 큰 fan-out에는 푸시를 SQS에 큐잉하고 워커가 fan-out하게 해 주세요.
+
+## 코드가 사는 곳
+
+- 라이브러리 소스: `simple-aws-interface` 리포지토리 (`sawsi` 패키지)에 있어요.
+- 참조 best-practice 프로젝트: `hm-serverless` 리포지토리예요.
+- 에이전트 harness: `agent-skills-sawsi` 리포지토리예요.
+
+harness 레이아웃은 [Agent Skills](/docs/reference/agent-skills)를 참고해 주세요.
+
+## 버전 관리
+
+라이브러리 버전은 `setup.py`에 있어요. 현재 시리즈는 `20.x`예요. 패치 릴리스는 후방 호환이고, 마이너 릴리스는 deprecation 경고를 추가할 수 있어요.
+
+업그레이드하려면:
+
+```bash
+pip install -U sawsi
+```
+
+그리고 프로젝트의 `api.py`를 새 `sawsi_boilerplate/api.py`와 다시 읽어 보면서 채택할 만한 새 래퍼가 있는지 확인해 주세요.

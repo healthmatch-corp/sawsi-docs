@@ -1,0 +1,206 @@
+---
+title: Deployment
+description: Container-image deploys through CodeBuild → ECR → Lambda update.
+---
+
+A sawsi deploy is **container-image based**. CodeBuild builds a Docker image, pushes it to ECR, and then updates one or more Lambda functions to point at the new image. This page walks the pipeline end to end.
+
+## The flow
+
+```
+git push  →  CodePipeline  →  CodeBuild
+                                  │
+                                  ├─ docker build (with build_keeper.py inside) → image
+                                  ├─ docker push → ECR
+                                  └─ for each Lambda in LAMBDAS:
+                                       aws lambda update-function-configuration  (env, memory, timeout)
+                                       aws lambda wait function-updated
+                                       aws lambda update-function-code           (image URI)
+```
+
+What runs inside `docker build`:
+
+1. Install Python 3.12 and `awslambdaric` (Lambda Runtime Interface Client).
+2. Install `requirements.txt`.
+3. Copy your code.
+4. **Run `build_keeper.py`** — this is where DynamoDB tables get created, S3 buckets get bucketed, Firehose streams get streamed. The build runs against the **target environment's** AWS account; the CodeBuild project has those credentials.
+5. Done — the resulting image is what Lambda will execute.
+
+The Lambda function shell (created beforehand in the console) just points at "the latest image in ECR for this repo." `update-function-code` updates the tag pointer.
+
+## Files involved
+
+| File | What it does |
+|---|---|
+| `Dockerfile.main` | Image for API-Gateway-style Lambdas. Minimal Python + deps. |
+| `Dockerfile.sqs` | Optional image for workers that need ffmpeg or heavier deps. |
+| `requirements.txt` | Python deps for `main`. |
+| `requirements-sqs.txt` | Optional separate deps for the sqs image. |
+| `buildspec-dev.yml` / `buildspec-prod.yml` | CodeBuild orchestration per environment. |
+| `buildspec-dev-sqs.yml` / `buildspec-prod-sqs.yml` | Separate buildspec when sqs image needs its own pipeline. |
+| `aws_iam_policy_dev.json` / `aws_iam_policy_prod.json` | IAM templates, applied manually or by IaC. |
+| `build_keeper.py` | Runs during `docker build`, initializes AWS resources. |
+
+## A reference Dockerfile.main
+
+```dockerfile title="Dockerfile.main"
+FROM public.ecr.aws/lambda/python:3.12
+
+# Lambda runtime interface client comes preinstalled in this base image
+
+# Optional: ffmpeg if your main image processes media
+# RUN dnf install -y ffmpeg && dnf clean all
+
+ENV PYTHONUNBUFFERED=1
+
+ARG env
+ENV env=${env}
+ARG AWS_DEFAULT_REGION
+ENV AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+ARG AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+ENV AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI}
+
+WORKDIR /var/task
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Run build_keeper.py with the same credentials CodeBuild has,
+# so DynamoDB tables / S3 buckets / Firehose streams are created or updated
+RUN python build_keeper.py
+
+# The Lambda handler is set per function via update-function-configuration,
+# so the CMD here is just a sensible default for `docker run`
+CMD ["main.aws_handler.handler"]
+```
+
+Critical points:
+
+- **`ARG env` + `ENV env`**: the deploy environment must be injected at build time so `build_keeper.py` and the inlined `api.py` resolve to the right resource names.
+- **`build_keeper.py` runs during build**: the credentials available are CodeBuild's, not the runtime Lambda's. Make sure CodeBuild's role has permission to create the resources `build_keeper.py` touches.
+- **Idempotency**: `build_keeper.py` runs on every build. Make sure each step (`sync_all_models`, `init_table`, `init`, `init_s3_bucket`) is safe to call repeatedly.
+
+## A reference buildspec-dev.yml
+
+```yaml title="buildspec-dev.yml"
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: ap-northeast-2
+    IMAGE_REPO_NAME: dev-myproject
+    LAMBDAS: |
+      [
+        {"name":"dev_myproject_main_docker",   "handler":"main.aws_handler.handler",   "image":"main", "memory":1800, "timeout":900},
+        {"name":"dev_myproject_admin_docker",  "handler":"admin.aws_handler.handler",  "image":"main", "memory":1024, "timeout":900},
+        {"name":"dev_myproject_queue_receiver","handler":"queue_receiver.aws_handler.handler", "image":"sqs", "memory":2048, "timeout":900},
+        {"name":"dev_myproject_scheduler",     "handler":"scheduler.aws_handler.handler","image":"main","memory":1024,"timeout":60},
+        {"name":"dev_myproject_s3trigger",     "handler":"s3trigger.aws_handler.handler","image":"sqs", "memory":2048,"timeout":900},
+        {"name":"dev_myproject_websocket",     "handler":"websocket_receiver.aws_handler.handler","image":"main","memory":512,"timeout":29},
+        {"name":"dev_myproject_webhook",       "handler":"webhook_receiver.aws_handler.handler","image":"main","memory":512,"timeout":29}
+      ]
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to ECR
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - IMAGE_TAG=$(date +%Y%m%d-%H%M%S)-$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c7)
+      - export ECR=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+  build:
+    commands:
+      - echo Building $IMAGE_REPO_NAME:$IMAGE_TAG (main)
+      - docker build -f Dockerfile.main --build-arg env=dev -t $IMAGE_REPO_NAME:main-$IMAGE_TAG .
+      - docker tag $IMAGE_REPO_NAME:main-$IMAGE_TAG $ECR/$IMAGE_REPO_NAME:main-latest
+      - docker tag $IMAGE_REPO_NAME:main-$IMAGE_TAG $ECR/$IMAGE_REPO_NAME:main-$IMAGE_TAG
+      - echo Building $IMAGE_REPO_NAME:$IMAGE_TAG (sqs)
+      - docker build -f Dockerfile.sqs  --build-arg env=dev -t $IMAGE_REPO_NAME:sqs-$IMAGE_TAG .
+      - docker tag $IMAGE_REPO_NAME:sqs-$IMAGE_TAG  $ECR/$IMAGE_REPO_NAME:sqs-latest
+      - docker tag $IMAGE_REPO_NAME:sqs-$IMAGE_TAG  $ECR/$IMAGE_REPO_NAME:sqs-$IMAGE_TAG
+
+  post_build:
+    commands:
+      - docker push $ECR/$IMAGE_REPO_NAME:main-$IMAGE_TAG
+      - docker push $ECR/$IMAGE_REPO_NAME:main-latest
+      - docker push $ECR/$IMAGE_REPO_NAME:sqs-$IMAGE_TAG
+      - docker push $ECR/$IMAGE_REPO_NAME:sqs-latest
+      - |
+        echo "$LAMBDAS" | jq -c '.[]' | while read row; do
+          name=$(echo "$row"   | jq -r '.name')
+          handler=$(echo "$row"| jq -r '.handler')
+          image=$(echo "$row"  | jq -r '.image')
+          memory=$(echo "$row" | jq -r '.memory')
+          timeout=$(echo "$row"| jq -r '.timeout')
+          imageuri=$ECR/$IMAGE_REPO_NAME:${image}-${IMAGE_TAG}
+          echo "Updating $name"
+          aws lambda update-function-configuration \
+              --function-name $name \
+              --image-config "{\"Command\": [\"$handler\"]}" \
+              --memory-size $memory \
+              --timeout $timeout \
+              --environment Variables="{env=dev}" \
+              > /dev/null
+          aws lambda wait function-updated --function-name $name
+          aws lambda update-function-code \
+              --function-name $name \
+              --image-uri $imageuri \
+              > /dev/null
+        done
+```
+
+The deploy is **per-function** — for N functions, N pairs of (`update-function-configuration`, `update-function-code`) calls. `wait function-updated` between them is essential or AWS will reject the second call as a concurrent update.
+
+## Pre-requisites the buildspec does NOT create
+
+Things that must exist before the buildspec runs:
+
+| Thing | How to create |
+|---|---|
+| ECR repository (`dev-myproject`) | `aws ecr create-repository --repository-name dev-myproject` (once) |
+| Lambda function shells (named in `LAMBDAS`) | AWS console → Create function → Container image → point at ECR repo |
+| Triggers (API Gateway routes, SQS event source mappings, EventBridge rules, S3 notifications) | AWS console, one per function |
+| IAM execution role for the Lambdas | `aws_iam_policy_{env}.json` attached to a role created in IAM |
+| Secrets in Secrets Manager (`{env}/{project}`) | `aws secretsmanager create-secret ...` |
+
+These are AWS-account operations done **once per environment**. They are not in the framework because they are infrastructure choices (which API Gateway route maps to which Lambda is your decision, not the framework's).
+
+For terraform / CDK users, all of this can be codified — sawsi is happy to live inside IaC.
+
+## Per-environment differences
+
+Production differs from dev mainly in:
+
+- IAM policy ARN prefixes (`prod-myproject*` vs `dev-myproject*`).
+- Lambda function names (`prod_myproject_*` vs `dev_myproject_*`).
+- ECR repo (`prod-myproject` vs `dev-myproject`).
+- `--build-arg env=prod` and `Variables={env=prod}` in the buildspec.
+- Memory/timeout values can differ (prod usually bigger).
+- `use_traceback=False` in the wrapper (or use a `config.env`-conditional).
+
+Keep `buildspec-prod.yml` and `aws_iam_policy_prod.json` as **separate files** rather than parameterizing one — divergence between envs is real and explicit is safer.
+
+## Adding a new Lambda
+
+1. AWS console: create the function shell (container-image-based, points at ECR repo, has an IAM role).
+2. IAM: extend `aws_iam_policy_{env}.json` if the new function needs new permissions.
+3. Trigger: wire the trigger (API Gateway route, SQS event source mapping, etc.).
+4. **buildspec**: add the new function to the `LAMBDAS` JSON array — both `dev` and `prod`.
+5. Source: `awsi add <app> -t <trigger>` generates the handler skeleton; commit it.
+6. Push → CodeBuild runs → the new function gets the latest image.
+
+If you skip step 4, the function will be created but never updated by CI.
+
+## Rollback
+
+`update-function-code --image-uri` is reversible: pick a previous `<env>-myproject:main-<old-tag>` from ECR and run the same command. Lambda re-points to the older image immediately. The build artifacts in ECR retain by default (no lifecycle policy unless you configure one) — keep them for at least a few weeks.
+
+Note that `build_keeper.py` cannot un-run — if a deploy added a DynamoDB GSI, rolling back the code does not delete the GSI. Forward-only schema changes are the safer pattern.
+
+## Next
+
+- [IAM](/docs/deployment/iam) — env-prefix scoping, per-service permissions.
+- [Lazy initialization](/docs/deployment/lazy-loading) — why `api.py` doesn't slow your cold start.
+- [Security](/docs/deployment/security) — the broader posture.

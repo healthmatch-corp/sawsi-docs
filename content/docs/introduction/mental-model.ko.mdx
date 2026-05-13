@@ -1,0 +1,155 @@
+---
+title: 멘탈 모델
+description: 이후 모든 챕터에서 들고 다닐 모양들을 알려드려요.
+---
+
+이 핸드북에서 다섯 개의 모양만 외울 수 있다면 아래 다섯 개를 외워 주세요. 매뉴얼의 다른 페이지는 모두 이것들의 정제예요.
+
+## 1. 요청 라이프사이클은 직선
+
+```
+API Gateway → aws_handler.handler → @aws_handler_wrapper → router() → @controller → service → DynamoModel
+```
+
+미들웨어 프레임워크 없음, DI 컨테이너 없음, 클래스 기반 뷰 없음이에요. 각 박스가 한 가지 일을 하고, 왼쪽 박스가 평범한 Python 값을 오른쪽 박스로 넘겨요.
+
+래퍼는 응답 정형화, 라우터는 디스패치, 컨트롤러는 요청 검증, 서비스는 비즈니스 로직, 모델은 I/O를 담당해요. **이후 페이지들은 개별 박스를 깊이 파지만, 이 직선 모양은 변하지 않아요.**
+
+## 2. `api.py`가 싱글턴 풀
+
+앱이 건드리는 모든 AWS 리소스는 **한 번** `api.py`에 선언돼요:
+
+```python title="api.py"
+from sawsi.aws.dynamodb.api import DynamoDBAPI
+from sawsi.aws.s3.api import S3API
+from sawsi.aws.secrets_manager.api import SecretManagerAPI
+from sawsi.shared.class_util import LazyLoadedAPI
+import config
+
+env = config.env
+project_name = 'myproject'
+
+dynamo: DynamoDBAPI = LazyLoadedAPI(DynamoDBAPI, f'{env}-{project_name}', region=config.region)
+s3_public: S3API = LazyLoadedAPI(S3API, f'{env}-{project_name}-public', region=config.region)
+secret_manager: SecretManagerAPI = LazyLoadedAPI(SecretManagerAPI, f'{env}/{project_name}', region=config.region)
+```
+
+코드베이스의 나머지 곳에서는 이렇게 써요:
+
+```python
+import api
+
+api.dynamo.put_item(...)
+api.s3_public.upload_file(...)
+```
+
+래퍼들은 `LazyLoadedAPI`로 감싸져 있어서 **`api.py`를 import하는 것만으로는 연결을 만들지 않아요**. 각 핸들의 첫 속성 접근에서 실제 생성자가 호출돼요 (스레드 락 뒤에서요). 이게 람다 콜드스타트와 AWS 자격증명이 없어야 하는 빌드 시점 스크립트에 중요해요.
+
+[심층: 지연 초기화 & 콜드스타트](/docs/deployment/lazy-loading)도 참고해 보세요.
+
+## 3. 리소스 이름은 `{env}-{project}[-{suffix}]`
+
+모든 AWS 리소스 — DynamoDB 테이블, S3 버킷, Locking 테이블, Firehose 스트림, SQS 큐 — 가 이 패턴을 따라요:
+
+| 리소스 | 이름 |
+|---|---|
+| DynamoDB 테이블 prefix | `dev-myproject` (테이블 이름은 `dev-myproject_user`, `dev-myproject_event`, …) |
+| S3 (공개 자산) | `dev-myproject-public` |
+| S3 (비공개 업로드) | `dev-myproject-uploads` |
+| Locking 테이블 | `dev-myproject-locking` |
+| Firehose 스트림 | `dev-myproject-firehose` |
+| Secrets Manager 시크릿 | `dev/myproject` |
+
+이건 미적 취향이 아니라 **load-bearing**이에요. IAM 정책(`aws_iam_policy_dev.json`, `aws_iam_policy_prod.json`)이 정확한 리소스 ARN 패턴으로 권한을 부여해요. 컨벤션을 깨면 dev에서는 안 났던 권한 에러를 prod에서 만나게 돼요.
+
+## 4. `build_keeper.py`는 **릴리스마다 1회** 실행
+
+```python title="build_keeper.py"
+import api
+import config
+from sawsi.model.base import sync_all_models
+
+def run():
+    config.build = True
+
+    sync_all_models(['main.model'])      # 1. DynamoDB 테이블 + GSI 생성/마이그레이션
+    api.locking.init_table()              # 2. Locking 테이블 생성
+    api.firehose_log.init()               # 3. Firehose 스트림 + IAM 역할 생성 (전파 위해 4s sleep)
+    api.s3_public.init_s3_bucket(acl='public-read')   # 4. S3 버킷 생성
+
+if __name__ == '__main__':
+    run()
+```
+
+`docker build` 동안 실행돼요 (Dockerfile이 `RUN` 단계로 호출해요). 그래서 이미지가 AWS를 호출해 새 이미지를 가리키도록 Lambda가 업데이트되기 전에 모든 리소스가 있도록 보장해 줘요.
+
+순서는 임의가 아니에요:
+
+1. `sync_all_models` 먼저 — 다른 것들이 의존할 수 있는 DynamoDB 테이블 생성이에요.
+2. `locking.init_table()` — DynamoDB 존재에 의존해요.
+3. `firehose_log.init()` — IAM 역할 생성이에요. IAM이 최종적 일관성이므로 `put_record`가 성공하려면 4초 sleep이 필요해요.
+4. `s3_public.init_s3_bucket()` — 독립적이지만, 여기서 실패가 테이블 생성을 막지 않도록 마지막에 둬요.
+
+`build_keeper.py` 안의 모든 것은 **멱등**해야 해요. 매 배포마다 실행되거든요.
+
+## 5. DynamoModel은 재정의하지 말아야 할 자동 필드를 가짐
+
+```python
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [('phone', None)]
+
+    name: str
+    phone: str = ' '
+```
+
+여러분의 필드 뒤에서, 모든 모델은 세 개의 자동 필드를 받아요:
+
+- `id: str` — UUID4, 파티션 키.
+- `crt: float` — 생성 타임스탬프, 기본 정렬 키.
+- `u_b: str` — 항상 `'_'`. "모든 행"을 시간순으로 조회할 수 있게 해 주는 내장 GSI의 파티션 키예요.
+
+이걸 **재정의하지 말아 주세요**. 프레임워크가 이들의 존재와 기본값에 의존해요.
+
+또 하나 체화할 것이 있어요. sparse-GSI 필드는 `Optional[str] = None`이 아니라 `str = ' '`(공백 한 칸)을 기본값으로 써요. DynamoDB는 인덱스 속성의 `NULL`을 거부하고, 한 칸 공백이면 GSI가 실질적 sparse로 동작해요. 자세한 추론은 [DynamoModel](/docs/data/dynamomodel)을 참고해 주세요.
+
+## 6. 트리거는 1급이면서 균일
+
+sawsi 프로젝트는 각자 `aws_handler.py`를 가진 여러 람다를 가질 수 있어요. CLI가 도와줘요:
+
+```bash
+awsi add queue_receiver -t sqs
+awsi add scheduler -t ebs
+awsi add websocket_receiver -t ws
+```
+
+각 트리거의 이벤트 모양은 약간씩 달라요 (SQS는 `Records`, EventBridge는 거의 빈 이벤트, WebSocket은 `connectionId`예요). 하지만 **핸들러 본문**은 여전히 `router(...)` 호출 (EventBridge는 `ScheduledTask(...) with do(...)` 패턴이에요)로 끝나요. 이 챕터의 컨벤션이 동일하게 적용돼요.
+
+트리거별 자세한 내용은 [트리거](/docs/handlers/triggers)를 참고해 주세요.
+
+## 종합
+
+들고 다닐 수 있는 가장 작은 그림이에요:
+
+```
+        ┌────────────────────────────────────────────────┐
+        │             api.py (LazyLoadedAPI)             │   ← 모든 AWS 클라이언트
+        └────────────────────────────────────────────────┘
+                          ▲
+                          │ 사용
+        ┌──────────────┐  │  ┌──────────────────────────┐
+        │   트리거       │──┴──│  controller → service     │
+        │ (agw/sqs/…)  │     │       ↓                   │
+        └──────┬───────┘     │     DynamoModel           │
+               │             └──────────────────────────┘
+               │
+       @aws_handler_wrapper
+               │
+            router()   ← allowed_cmd_prefixes 게이트
+               │
+         @controller
+```
+
+이 그림을 모든 다음 챕터에 들고 가 주세요.

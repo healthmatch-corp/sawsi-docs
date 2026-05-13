@@ -1,0 +1,20 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "---Foundations---",
+    "introduction",
+    "cli",
+    "---Building blocks---",
+    "handlers",
+    "data",
+    "auth",
+    "services",
+    "---Architecture---",
+    "architecture",
+    "deployment",
+    "---Practice---",
+    "practice",
+    "reference"
+  ]
+}

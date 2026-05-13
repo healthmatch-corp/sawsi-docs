@@ -1,0 +1,259 @@
+---
+title: 마이그레이션 레시피
+description: 스키마, 필드, 코드 마이그레이션 — 다운타임 없이 작동 중인 sawsi 시스템을 변경하는 법을 알려드려요.
+---
+
+DynamoDB는 스키마리스지만 `DynamoModel`이 충분한 구조를 더해서 일부 마이그레이션은 신중한 순서가 필요해요. 이 페이지가 가장 흔한 것들을 따라가요.
+
+## 1. 기본값이 있는 새 필드 추가
+
+쉬운 케이스예요. 모델만 편집하면 돼요.
+
+```python
+class User(DynamoModel):
+    ...
+    # 새 필드
+    timezone: str = 'Asia/Seoul'
+```
+
+배포하세요. 기존 row는 속성이 없어요 — `User.get(...)`이 그것들을 읽고, Pydantic이 기본값을 적용해 줘요 — 항상 가지고 있었던 것처럼 보여요.
+
+**경고 — DynamoDB에 *기본값을 다시 쓰고* 싶다면 이렇게 하세요.**
+
+```python
+user = User.get(user_id)
+# user.timezone이 'Asia/Seoul' (기본값) — 하지만 DynamoDB엔 속성 없음
+user.update()
+# 이건 NO-OP — 변경된 필드 없음
+user.update(force_update_default_fields=True)
+# 이제 timezone이 써져요
+```
+
+코드가 `timezone`을 읽고 DynamoDB에 있다고 기대하면, 일회성 마이그레이션을 실행하세요.
+
+```python title="main/migration/20260513_backfill_timezone.py"
+from main.model.user import User
+for u in User.generate(limit=1000):
+    u.timezone = u.timezone   # 변경됨으로 표시
+    u.update()
+```
+
+## 2. 새 GSI 추가
+
+모델을 편집해요.
+
+```python
+class User(DynamoModel):
+    _indexes = [
+        ('phone', None),
+        ('email', None),               # 새로워요
+    ]
+```
+
+다음 배포에 `build_keeper.py`가 `sync_all_models`를 호출해요 — 누락 인덱스를 감지하고 만들어 줘요. DynamoDB GSI 생성은 **온라인**이에요 — 기존 row가 인덱스로 백필되고, 그 동안 테이블이 쿼리 가능한 상태를 유지해요.
+
+**두 가지 경고가 있어요.**
+
+- 큰 테이블의 GSI 생성은 분~시간이 걸릴 수 있어요. 새 인덱스에 대한 읽기가 임계적이면 배포 시점을 계획하세요.
+- 백필 동안 GSI에 대한 쿼리는 불완전한 결과를 반환할 수 있어요. 배포에서 GSI 추가, 대기, 그리고 그걸 쓰는 코드를 출시하는 순서로 가세요.
+
+## 3. None 필드를 sparse `' '`로 변환
+
+기존 필드가 `Optional[str] = None`으로 선언돼 있고, GSI 키임을 발견(또는 그렇게 만들고 싶음)했다면 — 변환이 필요해요.
+
+단계는 이래요.
+
+1. 모델에서 필드 기본값과 타입을 변경하세요.
+
+   ```python
+   # 전
+   invite_code: Optional[str] = None
+   # 후
+   invite_code: str = ' '
+   ```
+
+2. 필드를 **읽는** 모든 자리를 `.strip()` 사용으로 갱신하세요.
+
+   ```python
+   # 전
+   if user.invite_code:
+       ...
+   # 후
+   if user.invite_code.strip():
+       ...
+   ```
+
+3. 쓰기 전 **None을 제거**하도록 `put()` / `update()`를 오버라이드하세요 — 미래 버그 방어용이에요.
+
+   ```python
+   def put(self, can_overwrite=False):
+       self.validate_model(self)
+       item = {k: v for k, v in self.model_dump().items() if v is not None}
+       self.__dynamo__.put_item(self._table_name(), item, can_overwrite)
+       return self
+   ```
+
+4. 기존 row를 백필하세요.
+
+   ```python title="main/migration/20260513_invite_code_sparse.py"
+   from main.model.user import User
+   for u in User.generate(limit=1000):
+       if u.invite_code is None or u.invite_code == '':
+           u.invite_code = ' '
+           u.update(force_update_default_fields=True)
+   ```
+
+5. 같은 배포(또는 후속)에서 GSI를 추가하세요.
+
+   ```python
+   _indexes = [..., ('invite_code', None)]
+   ```
+
+## 4. 모델 필드 이름 변경
+
+DynamoDB는 위치가 아니라 속성 이름을 저장해요 — 이름 변경은 복사가 필요해요.
+
+```python
+class User(DynamoModel):
+    description: str = ''     # 옛 이름
+    bio: str = ''             # 새 이름
+```
+
+마이그레이션이에요.
+
+```python
+for u in User.generate(limit=1000):
+    if u.description and not u.bio:
+        u.bio = u.description
+        u.description = ''
+        u.update()
+```
+
+검증 후, 모델에서 옛 필드를 제거하고 DynamoDB에서 속성을 제거하는 클린업 패스를 실행하세요 (DynamoDB는 명시적 `REMOVE` 절을 요구해요 — 가장 단순한 길은 `u.description = None` + `None` 키를 떨구는 `put`/`update` 오버라이드예요).
+
+## 5. 모델을 둘로 분리
+
+row가 필드가 너무 많아지고 쿼리가 다루기 어려워질 때 흔한 케이스예요.
+
+단계는 이래요.
+
+1. 새 모델을 정의하세요.
+
+   ```python
+   class UserProfile(DynamoModel):
+       __dynamo__ = api.dynamo
+       _table = 'user_profile'
+       _indexes = [('user_id', None)]
+       user_id: str
+       avatar_url: str = ''
+       bio: str = ''
+       interests: list[str] = []
+   ```
+
+2. `User`에서 관련 필드를 복사하는 마이그레이션을 실행하세요.
+
+   ```python
+   for u in User.generate(limit=1000):
+       up = UserProfile(user_id=u.id, avatar_url=u.avatar_url, bio=u.bio, interests=u.interests)
+       up.put()
+   ```
+
+3. 서비스가 `UserProfile`에서 읽도록 갱신하세요.
+
+   ```python
+   def get_user_profile(user_id):
+       items, _ = UserProfile.query(pk_field='user_id', pk_value=user_id, limit=1)
+       return items[0] if items else None
+   ```
+
+4. 롤아웃 동안 fallback으로 `User`의 필드를 잠시 유지하고, 후속에서 제거하세요.
+
+## 6. `_table` 이름 변경
+
+가능하면 피하세요 — DynamoDB 테이블은 이름이 안 바뀌어요. 우회는 새 테이블 이름으로 새 모델 정의, 마이그레이션, 그리고 옛 것 제거예요.
+
+해야만 한다면 이렇게 해요.
+
+1. `user_v2`를 가리키는 `UserV2`를 정의하세요.
+2. `User`의 모든 row를 `UserV2`로 마이그레이션하세요.
+3. 모든 read/write를 `UserV2`로 전환하세요.
+4. 결국 옛 `User` 모델과 옛 테이블을 드롭하세요.
+
+최소 릴리스 한 주기는 걸린다고 계획하세요.
+
+## 7. 모델 드롭
+
+```python
+# 모델 파일에서:
+# (@sync 데코레이터와 클래스 자체 제거)
+```
+
+`sync_all_models`가 테이블을 다시 만들지 않아요. DynamoDB의 기존 테이블은 수동으로 삭제할 때까지 그대로 유지돼요 (프레임워크가 의도적으로 undefine에서 테이블을 드롭하지 않아요).
+
+활성 클린업이에요.
+
+```bash
+aws dynamodb delete-table --table-name dev-myproject_user_v1
+```
+
+이 명령 발행 전에 어떤 람다도 그 테이블에서 읽지 않는지 확실히 하세요.
+
+## 8. 옛 코드를 재번호 매기지 않고 새 에러 코드 추가
+
+```python title="errs.py"
+err_n = 1
+def auto(category):
+    global err_n
+    n = err_n
+    err_n += 1
+    return f'{category}{n:04d}'
+
+# 기존 — 재배열 금지
+no_session         = AppError(auto('S'), 'no_session')         # S0001
+invalid_session    = AppError(auto('S'), 'invalid_session')    # S0002
+...
+
+# 새 에러는 맨 아래에
+new_error          = AppError(auto('S'), 'new_error')          # S0063
+```
+
+한 번 코드가 부여되면 그대로 유지해야 해요. 재배열이 특정 코드를 처리하는 클라이언트를 깨뜨려요.
+
+## 9. dev 한정 기능을 prod로 승격
+
+기본 sawsi 패턴은 `if config.env == 'dev':` 안의 모든 것이 dev 한정이에요. 승격하려면 이렇게 하세요.
+
+1. `if config.env == 'dev':` 가드를 제거하세요.
+2. `aws_iam_policy_prod.json`이 기능이 필요한 권한을 갖는지 확인하세요.
+3. `prod/myproject`에 필요한 모든 Secrets가 존재하는지 확인하세요.
+4. 새 버킷/테이블/큐/GSI가 prod에 최소 1회 배포되었는지 확인하세요 (보통 dev가 `build_keeper.py` 경유로 먼저 배포돼요 — 변경 후 prod의 첫 배포가 픽업해요).
+
+## 10. 롤백
+
+`update-function-code --image-uri <old-tag>`로 되돌릴 수 있어요.
+
+코드 롤백으로 되돌릴 수 **없는** 것들이에요.
+
+- 생성된 DynamoDB 테이블.
+- 생성된 GSI (롤백이 그대로 둬요).
+- 생성된 S3 버킷.
+- 생성된 Firehose 스트림.
+- 스키마 변경 (추가된 필드는 추가된 채로 유지돼요).
+
+규칙은 **전진만 가능한 스키마**예요. 코드는 뒤로 갈 수 있지만 스키마는 앞으로만 가요. 스키마 변경을 되돌려야 한다면, 롤백이 아니라 그것을 되돌리는 또 다른 전진 마이그레이션을 하세요.
+
+## 11. 호환되지 않는 변경의 2단계
+
+변경이 후방 호환될 수 없을 때 (DynamoDB에선 드물고, cmd 시그니처에선 흔해요) 이렇게 해요.
+
+1. **배포 1**: 옛 동작과 새 동작 모두 출시 — Secrets Manager의 기능 플래그나 Variable 모델로 제어하세요.
+2. **클라이언트 전환**: 새 cmd를 쓰는 새 모바일/웹 클라이언트를 롤아웃하세요.
+3. **배포 2**: 옛 동작 제거.
+
+이 2단계의 비용은 추가 배포 하나예요. 안 하는 비용은 옛 클라이언트 버전의 화난 사용자고요.
+
+## 이것이 *아닌* 것
+
+- 도구가 아니에요. `awsi migrate` 명령은 없어요. 마이그레이션은 `main/migration/`의 Python 스크립트예요 — 수동으로 (로컬 또는 일회성 람다 경유) 실행해요.
+- 트랜잭션이 아니에요. DynamoDB는 여러 row에 걸친 트랜잭션이 없어요. 부분 완료가 안전하도록 마이그레이션을 멱등하게 계획하세요.
+- 사고를 대체하지 않아요. 각 마이그레이션 계획은 배포 전에 끝에서 끝까지 검토되어야 해요.

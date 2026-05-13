@@ -1,0 +1,205 @@
+---
+title: 배포
+description: CodeBuild → ECR → Lambda update 경로를 따라가는 컨테이너 이미지 배포 흐름을 알려드려요.
+---
+
+sawsi 배포는 **컨테이너 이미지 기반**이에요. CodeBuild가 Docker 이미지를 빌드하고 ECR에 푸시한 뒤, 람다 함수 하나 또는 여러 개를 새 이미지를 가리키도록 업데이트해요. 이 페이지에서 파이프라인을 끝에서 끝까지 따라가 볼게요.
+
+## 흐름
+
+```
+git push  →  CodePipeline  →  CodeBuild
+                                  │
+                                  ├─ docker build (안에 build_keeper.py) → 이미지
+                                  ├─ docker push → ECR
+                                  └─ LAMBDAS 안의 각 람다에 대해:
+                                       aws lambda update-function-configuration  (env, memory, timeout)
+                                       aws lambda wait function-updated
+                                       aws lambda update-function-code           (image URI)
+```
+
+`docker build` 안에서 일어나는 일은 이래요:
+
+1. Python 3.12와 `awslambdaric`(Lambda Runtime Interface Client) 설치.
+2. `requirements.txt` 설치.
+3. 코드 복사.
+4. **`build_keeper.py` 실행** — DynamoDB 테이블이 생성되고, S3 버킷이 버킷팅되고, Firehose 스트림이 스트림팅되는 곳이에요. 빌드는 **타깃 환경의** AWS 계정에 대해 실행돼요 — CodeBuild 프로젝트가 그 자격증명을 가져요.
+5. 끝 — 결과 이미지가 람다가 실행할 이미지예요.
+
+람다 함수 셸(콘솔에서 미리 생성)은 그저 "이 repo의 ECR 최신 이미지"를 가리켜요. `update-function-code`가 태그 포인터를 업데이트해요.
+
+## 관련 파일
+
+| 파일 | 역할 |
+|---|---|
+| `Dockerfile.main` | API Gateway 스타일 람다용 이미지. 최소 Python + deps. |
+| `Dockerfile.sqs` | ffmpeg나 무거운 deps가 필요한 워커용 옵션 이미지. |
+| `requirements.txt` | `main`용 Python deps. |
+| `requirements-sqs.txt` | sqs 이미지용 별도 deps (옵션). |
+| `buildspec-dev.yml` / `buildspec-prod.yml` | 환경당 CodeBuild 오케스트레이션. |
+| `buildspec-dev-sqs.yml` / `buildspec-prod-sqs.yml` | sqs 이미지가 자체 파이프라인이 필요할 때 쓰는 별도 buildspec. |
+| `aws_iam_policy_dev.json` / `aws_iam_policy_prod.json` | IAM 템플릿, 수동 또는 IaC로 적용해요. |
+| `build_keeper.py` | `docker build` 동안 실행되어 AWS 리소스를 초기화해요. |
+
+## 참조 Dockerfile.main
+
+```dockerfile title="Dockerfile.main"
+FROM public.ecr.aws/lambda/python:3.12
+
+# 이 베이스 이미지엔 람다 런타임 인터페이스 클라이언트가 사전 설치돼 있어요
+# 옵션: main 이미지가 미디어를 처리하면 ffmpeg
+# RUN dnf install -y ffmpeg && dnf clean all
+
+ENV PYTHONUNBUFFERED=1
+
+ARG env
+ENV env=${env}
+ARG AWS_DEFAULT_REGION
+ENV AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+ARG AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+ENV AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI}
+
+WORKDIR /var/task
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# CodeBuild가 가진 같은 자격증명으로 build_keeper.py 실행하면,
+# DynamoDB 테이블 / S3 버킷 / Firehose 스트림이 생성/갱신돼요
+RUN python build_keeper.py
+
+# 람다 핸들러는 update-function-configuration으로 함수별로 설정되므로,
+# 여기 CMD는 `docker run`용의 합리적 기본값일 뿐이에요
+CMD ["main.aws_handler.handler"]
+```
+
+핵심은 이래요:
+
+- **`ARG env` + `ENV env`**: 배포 환경이 빌드 타임에 주입되어야 `build_keeper.py`와 인라인된 `api.py`가 올바른 리소스 이름으로 풀려요.
+- **`build_keeper.py`가 빌드 동안 실행**: 사용 가능한 자격증명은 CodeBuild의 것이에요 — 런타임 람다의 것이 아니에요. CodeBuild의 역할이 `build_keeper.py`가 건드리는 리소스를 만들 권한을 갖는지 확인해 주세요.
+- **멱등성**: `build_keeper.py`가 매 빌드마다 실행돼요. 각 단계(`sync_all_models`, `init_table`, `init`, `init_s3_bucket`)가 반복 호출에 안전한지 확인해 주세요.
+
+## 참조 buildspec-dev.yml
+
+```yaml title="buildspec-dev.yml"
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: ap-northeast-2
+    IMAGE_REPO_NAME: dev-myproject
+    LAMBDAS: |
+      [
+        {"name":"dev_myproject_main_docker",   "handler":"main.aws_handler.handler",   "image":"main", "memory":1800, "timeout":900},
+        {"name":"dev_myproject_admin_docker",  "handler":"admin.aws_handler.handler",  "image":"main", "memory":1024, "timeout":900},
+        {"name":"dev_myproject_queue_receiver","handler":"queue_receiver.aws_handler.handler", "image":"sqs", "memory":2048, "timeout":900},
+        {"name":"dev_myproject_scheduler",     "handler":"scheduler.aws_handler.handler","image":"main","memory":1024,"timeout":60},
+        {"name":"dev_myproject_s3trigger",     "handler":"s3trigger.aws_handler.handler","image":"sqs", "memory":2048,"timeout":900},
+        {"name":"dev_myproject_websocket",     "handler":"websocket_receiver.aws_handler.handler","image":"main","memory":512,"timeout":29},
+        {"name":"dev_myproject_webhook",       "handler":"webhook_receiver.aws_handler.handler","image":"main","memory":512,"timeout":29}
+      ]
+
+phases:
+  pre_build:
+    commands:
+      - echo ECR 로그인
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - IMAGE_TAG=$(date +%Y%m%d-%H%M%S)-$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c7)
+      - export ECR=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+  build:
+    commands:
+      - echo Building $IMAGE_REPO_NAME:$IMAGE_TAG (main)
+      - docker build -f Dockerfile.main --build-arg env=dev -t $IMAGE_REPO_NAME:main-$IMAGE_TAG .
+      - docker tag $IMAGE_REPO_NAME:main-$IMAGE_TAG $ECR/$IMAGE_REPO_NAME:main-latest
+      - docker tag $IMAGE_REPO_NAME:main-$IMAGE_TAG $ECR/$IMAGE_REPO_NAME:main-$IMAGE_TAG
+      - echo Building $IMAGE_REPO_NAME:$IMAGE_TAG (sqs)
+      - docker build -f Dockerfile.sqs  --build-arg env=dev -t $IMAGE_REPO_NAME:sqs-$IMAGE_TAG .
+      - docker tag $IMAGE_REPO_NAME:sqs-$IMAGE_TAG  $ECR/$IMAGE_REPO_NAME:sqs-latest
+      - docker tag $IMAGE_REPO_NAME:sqs-$IMAGE_TAG  $ECR/$IMAGE_REPO_NAME:sqs-$IMAGE_TAG
+
+  post_build:
+    commands:
+      - docker push $ECR/$IMAGE_REPO_NAME:main-$IMAGE_TAG
+      - docker push $ECR/$IMAGE_REPO_NAME:main-latest
+      - docker push $ECR/$IMAGE_REPO_NAME:sqs-$IMAGE_TAG
+      - docker push $ECR/$IMAGE_REPO_NAME:sqs-latest
+      - |
+        echo "$LAMBDAS" | jq -c '.[]' | while read row; do
+          name=$(echo "$row"   | jq -r '.name')
+          handler=$(echo "$row"| jq -r '.handler')
+          image=$(echo "$row"  | jq -r '.image')
+          memory=$(echo "$row" | jq -r '.memory')
+          timeout=$(echo "$row"| jq -r '.timeout')
+          imageuri=$ECR/$IMAGE_REPO_NAME:${image}-${IMAGE_TAG}
+          echo "Updating $name"
+          aws lambda update-function-configuration \
+              --function-name $name \
+              --image-config "{\"Command\": [\"$handler\"]}" \
+              --memory-size $memory \
+              --timeout $timeout \
+              --environment Variables="{env=dev}" \
+              > /dev/null
+          aws lambda wait function-updated --function-name $name
+          aws lambda update-function-code \
+              --function-name $name \
+              --image-uri $imageuri \
+              > /dev/null
+        done
+```
+
+배포는 **함수당** 진행돼요 — N개 함수면 N쌍의 (`update-function-configuration`, `update-function-code`) 호출이에요. 그 사이의 `wait function-updated`가 필수예요 — 없으면 AWS가 두 번째 호출을 동시 업데이트로 거부해요.
+
+## buildspec이 만들지 **않는** 사전 요구
+
+buildspec 실행 전에 존재해야 하는 것들이에요:
+
+| 대상 | 만드는 법 |
+|---|---|
+| ECR 리포지토리 (`dev-myproject`) | `aws ecr create-repository --repository-name dev-myproject` (1회) |
+| `LAMBDAS`에 명명된 람다 함수 셸 | AWS 콘솔 → Create function → Container image → ECR repo 가리키기 |
+| 트리거 (API Gateway 라우트, SQS event source mapping, EventBridge 규칙, S3 알림) | AWS 콘솔, 함수당 하나 |
+| 람다용 IAM 실행 역할 | IAM에 만든 역할에 `aws_iam_policy_{env}.json` 부착 |
+| Secrets Manager의 시크릿 (`{env}/{project}`) | `aws secretsmanager create-secret ...` |
+
+이는 **환경당 1회** 수행하는 AWS 계정 작업이에요. 프레임워크에 들어가지 않는 이유는 인프라 선택이기 때문이에요 (어느 API Gateway 라우트가 어느 람다에 매핑되는지는 직접 결정해야 해요 — 프레임워크 영역이 아니에요).
+
+terraform / CDK 사용자라면 이 모두를 코드화할 수 있어요 — sawsi는 IaC 안에 살아도 행복해요.
+
+## 환경별 차이
+
+prod는 dev와 주로 다음에서 달라요:
+
+- IAM 정책 ARN prefix (`prod-myproject*` vs `dev-myproject*`).
+- 람다 함수 이름 (`prod_myproject_*` vs `dev_myproject_*`).
+- ECR repo (`prod-myproject` vs `dev-myproject`).
+- buildspec의 `--build-arg env=prod`와 `Variables={env=prod}`.
+- Memory/timeout 값이 다를 수 있어요 (prod가 보통 더 커요).
+- 래퍼의 `use_traceback=False` (또는 `config.env` 조건 사용).
+
+`buildspec-prod.yml`과 `aws_iam_policy_prod.json`을 **별도 파일**로 유지해 주세요 — 하나를 파라미터화하는 것보다 나아요. env 간 발산은 실재하니까 명시적인 게 더 안전해요.
+
+## 새 람다 추가
+
+1. AWS 콘솔: 함수 셸 생성 (컨테이너 이미지 기반, ECR repo 가리킴, IAM 역할 있음).
+2. IAM: 새 함수가 새 권한이 필요하면 `aws_iam_policy_{env}.json` 확장.
+3. 트리거: 트리거 연결 (API Gateway 라우트, SQS event source mapping 등).
+4. **buildspec**: 새 함수를 `LAMBDAS` JSON 배열에 추가 — `dev`와 `prod` 모두.
+5. 소스: `awsi add <app> -t <trigger>`가 핸들러 스켈레톤을 만들어요 — 커밋해 주세요.
+6. 푸시 → CodeBuild 실행 → 새 함수가 최신 이미지를 받아요.
+
+4단계를 건너뛰면 함수는 생성되지만 CI가 업데이트하지 않아요.
+
+## 롤백
+
+`update-function-code --image-uri`는 되돌릴 수 있어요: ECR에서 이전 `<env>-myproject:main-<old-tag>`을 골라 같은 명령을 실행하면 돼요. 람다가 즉시 옛 이미지를 다시 가리켜요. ECR의 빌드 아티팩트는 기본적으로 보유돼요(라이프사이클 정책을 구성하지 않는 한) — 최소 몇 주는 보관해 주세요.
+
+`build_keeper.py`는 되돌릴 수 없어요 — 배포가 DynamoDB GSI를 추가했다면, 코드를 롤백해도 GSI는 삭제되지 않아요. 전진만 가능한 스키마 변경이 더 안전한 패턴이에요.
+
+## 다음
+
+- [IAM](/docs/deployment/iam) — env-prefix 스코핑, 서비스별 권한.
+- [지연 초기화](/docs/deployment/lazy-loading) — `api.py`가 콜드스타트를 느리게 하지 않는 이유.
+- [보안](/docs/deployment/security) — 더 넓은 자세.

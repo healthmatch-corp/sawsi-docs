@@ -1,0 +1,191 @@
+---
+title: AI, Vector & Search
+description: LLM용 Bedrock, 임베딩용 S3Vector + VectorKB, 한글 n-gram 자동완성용 SearchEngine을 다뤄요.
+---
+
+sawsi는 AI 인접 서비스에 다섯 개의 래퍼를 제공해요. 서로 독립적이지만 조합도 잘 돼요 — VectorKB는 임베딩에 Bedrock을, 저장에 S3 Vector를 사용하고, SearchEngine은 인덱싱에 DynamoDB를 사용해요.
+
+## Bedrock — LLM 호출
+
+`BedrockAPI`는 **Converse API**(고수준, tool-calling 친화)와 더 오래된 **InvokeModel API**(raw)를 둘 다 감싸요.
+
+```python
+resp = api.bedrock.converse(
+    model_id='anthropic.claude-haiku-4-5-20251001',
+    system='You translate text to Korean.',
+    messages=[
+        {'role': 'user', 'content': [{'text': 'Hello world'}]},
+    ],
+    max_tokens=512,
+    temperature=0.0,
+)
+print(resp['output']['message']['content'][0]['text'])
+```
+
+Tool 사용:
+
+```python
+resp = api.bedrock.converse(
+    model_id='anthropic.claude-haiku-4-5-20251001',
+    messages=messages,
+    tool_config={
+        'tools': [{'toolSpec': {
+            'name': 'get_weather',
+            'inputSchema': {'json': {'type': 'object', 'properties': {'city': {'type': 'string'}}}},
+        }}],
+    },
+)
+```
+
+래퍼는 대화를 **영속화하지 않아요**. 채팅 이력을 영속화(DynamoDB 등)하는 건 애플리케이션의 몫이에요 — 래퍼는 단일 호출만 담당해요.
+
+### 모델 선택
+
+- `claude-haiku-4-5-...` — 빠르고 저렴해요. 일상적인 추출에 좋아요.
+- `claude-sonnet-4-6-...` — 균형이 잡혀 있어요.
+- `claude-opus-4-7-...` — 가장 강력해요. 아껴서 사용해 주세요.
+
+모델 id를 `config.py`나 `secret_manager`에 핀해서 dev/prod가 다른 모델을 A/B 할 수 있게 해 주세요.
+
+### 비용 & 레이트 제한
+
+Bedrock 가격은 토큰 단위예요. 모든 호출에 max-tokens 캡을 설정해 주세요. 결정적 작업(추출, 번역)엔 `temperature=0.0`을 써서 결과를 캐시할 수 있게 해 주세요.
+
+## S3 Vector — S3 위 벡터 스토어
+
+`S3VectorAPI`는 S3 위에 구현된 벡터 스토어예요(인덱스 1개 = 버킷 prefix 1개). 저렴하고, 좀 느린 편이고, 수백만 벡터까지 OK예요.
+
+직접 쓰는 일은 별로 없어요 — 위 계층(`VectorKBAPI`)이 Bedrock 임베딩과 연결해 줘요.
+
+## Vector KB — 임베딩 + 저장
+
+`VectorKBAPI`는 RAG의 권장 진입점이에요:
+
+```python title="api.py"
+vector_kb = LazyLoadedAPI(
+    VectorKBAPI,
+    vector_bucket_name=f'{env}-{project_name}-vector',
+    index_name='product_descriptions',
+    embed_model_id='amazon.titan-embed-text-v2:0',
+    dimension=1024,
+    distance_metric='cosine',
+    region=region,
+)
+```
+
+```python
+# build_keeper.py
+api.vector_kb.init()
+
+# 코드에서
+api.vector_kb.add(key='prod-123', text='방수 빨간 러닝화', metadata={'sku': 'RR-123'})
+
+results = api.vector_kb.search('비 오는 날 신발', top_k=3)
+for r in results:
+    print(r['key'], r['score'], r['metadata'])
+```
+
+`add()`가 실제로 하는 일:
+
+1. Bedrock을 호출해 `text`를 1024차원 벡터로 임베딩해요.
+2. `(key, vector, text, metadata)`를 `index_name` 아래 S3 Vector에 저장해요.
+
+`search()`가 실제로 하는 일:
+
+1. 쿼리 텍스트를 임베딩해요.
+2. 코사인 유사도로 상위 k개 인근 벡터를 찾아요.
+3. 저장된 메타데이터와 원본 텍스트를 반환해요.
+
+기본 모델은 `amazon.titan-embed-text-v2:0`, 1024 차원이에요. 둘 중 하나를 바꾸면 재인덱싱이 필요해요 — 차원이 다른 벡터는 비교할 수 없거든요.
+
+## OpenSearch — 전문 검색
+
+벡터를 넘어서는 전문 검색(BM25, 패싯, 집계)은 `OpenSearchAPI`로 OpenSearch를 직접 사용해 주세요. 프레임워크가 SigV4로 요청에 서명해 주지만 그 외에는 비켜서 있어요.
+
+```python
+api.opensearch.put_document('products', product.id, {
+    'name': product.name,
+    'description': product.description,
+    'category': product.category,
+})
+
+response = api.opensearch.run(
+    'POST', '/products/_search',
+    body={
+        'query': {'multi_match': {
+            'query': '비 오는 날 러닝화',
+            'fields': ['name^2', 'description'],
+        }},
+        'aggs': {'by_category': {'terms': {'field': 'category.keyword'}}},
+    },
+)
+```
+
+인덱스 매핑과 재인덱싱 전략은 직접 챙겨야 해요. 래퍼는 의도적으로 저수준으로 두었어요.
+
+## SearchEngine — 한글 n-gram 자동완성
+
+자동완성과 prefix 검색(특히 한글 텍스트 위)은 DynamoDB만으로 충분해요. `sawsi.service.searchengine.SearchEngine`이 DynamoDB 테이블 안에 2-gram 역색인을 만들어 줘요:
+
+```python
+from sawsi.service.searchengine import SearchEngine
+
+product_search = SearchEngine(api.dynamo, 'product_search')
+
+# build_keeper.py
+product_search.init_table()
+
+# 제품 생성/수정마다
+product_search.put_data(item_id=product.id, text=product.name)
+
+# 자동완성 시
+results = product_search.search(query='러닝')
+```
+
+내부적으로 각 텍스트가 start/end 마커와 함께 2-gram으로 분해돼요:
+
+```
+'러닝화' → ['^러', '러닝', '닝화', '화$']
+```
+
+각 n-gram이 `(n_gram, item_id)` 키의 row가 돼요. `'러닝'` 검색이 파티션 `'러닝'`을 조회하고, 그 n-gram을 공유하는 모든 item_id를 반환해요 (총 매칭 수로 랭킹).
+
+특성:
+
+- 순수 DynamoDB라서 OpenSearch 의존성도, 검색 클러스터 콜드스타트도 없어요.
+- 한국어, 일본어, 중국어, 라틴 알파벳에서 동작해요.
+- 거의 선형으로 스케일링돼요 — 인덱스당 수십만 아이템까지 OK예요.
+- 관련도 튜닝(BM25, 동의어, 형태소)은 없어요 — 그건 OpenSearch가 담당해요.
+
+## 종합
+
+전형적인 AI 기능 스택을 보여 드릴게요:
+
+```
+사용자 쿼리
+   │
+   ▼
+SearchEngine (자동완성, 즉각 필터링)
+   │ (no hit / 의미 검색 원함)
+   ▼
+VectorKB.search()  — RAG 코퍼스에서 상위 5 후보
+   │
+   ▼
+Bedrock.converse(messages=[..., context_from_candidates])
+   │
+   ▼
+응답
+```
+
+각 조각이 얇은 래퍼예요. 오케스트레이션은 서비스 모듈 안의 평범한 Python으로 해요.
+
+## 비용과 예산
+
+| 서비스 | 비용 동인 |
+|---|---|
+| Bedrock | 토큰 (입력 + 출력) |
+| S3 Vector / VectorKB | S3 GET/PUT + 저장; 저렴 |
+| OpenSearch | 시간당 인스턴스 청구 — 클러스터 크기 |
+| SearchEngine | DynamoDB RCU/WCU — n-gram 조회만 |
+
+저트래픽 앱에선 Bedrock + SearchEngine + VectorKB의 아이들 비용이 사실상 0이에요. OpenSearch는 바닥(가장 작은 클러스터)이 있어서 SearchEngine을 넘어선 후에야 의미가 있어요.

@@ -1,0 +1,190 @@
+---
+title: Sessions
+description: User sessions, secure tokens, OTP-style replay protection, and the no-session whitelist.
+---
+
+sawsi has no opinion about authentication providers, but it does have a convention for **session lifetime, replay protection, and how a request reaches its `user` object**. This page covers that convention.
+
+## The session model
+
+```python title="main/model/user_session.py"
+from secrets import token_urlsafe
+from sawsi.model.base import DynamoModel, sync
+from pydantic import BaseModel
+import api
+
+class DeviceInfo(BaseModel):
+    build_number: str | None = None
+    version: str | None = None
+    platform_os: str | None = None
+    platform_version: str | None = None
+    language: str | None = 'ko'
+
+@sync
+class UserSession(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user_session'
+    _indexes = [('user_id', 'crt')]
+
+    user_id: str
+    source_ip: str
+    device_info: DeviceInfo = DeviceInfo()
+
+    use_secure: bool = False
+    otp_secret: str = token_urlsafe(32)
+    ts_offset: int = 0
+```
+
+The session has three security knobs:
+
+- `otp_secret` — a 32-byte URL-safe random token, generated server-side once at session creation. Never sent back to the client in cleartext after creation.
+- `ts_offset` — the difference between the client's clock and the server's, captured at session creation. Lets the OTP window accept clients with skewed clocks.
+- `use_secure` — feature flag for the OTP-replay check (false for legacy sessions during migration; true for all new sessions).
+
+## Authenticating a request
+
+The handler is the only place that touches the session table. Once it has a `User`, it stuffs it into `body['user']` and every controller that names `user` in its signature gets it via Layer 4 injection.
+
+```python title="main/aws_handler.py"
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+
+    sid = headers.get('session_id')
+    o_c = body.get('o_c')                  # client-computed OTP code
+    req_ts = int(event['requestContext']['requestTimeEpoch']) / 1000
+
+    body['user'] = None
+    if sid:
+        body['user'] = auth_service.get_me(session_id=sid, o_c=o_c, req_ts=req_ts)
+
+    return router(body.pop('cmd'), body, headers, allowed_cmd_prefixes=['main.controller'])
+```
+
+`auth_service.get_me()` is your project's resolver. The typical shape:
+
+```python
+def get_me(session_id, o_c, req_ts):
+    session = UserSession.get(session_id)
+    if not session:
+        raise errs.invalid_session
+
+    if session.use_secure:
+        _verify_otp(session, o_c, req_ts)    # raises if window misses
+
+    user = User.get(session.user_id)
+    if not user:
+        raise errs.no_such_user
+    return user
+```
+
+## OTP-style replay protection
+
+The `otp_secret` and `ts_offset` together implement a simple rolling-window replay check:
+
+- At login, server sends `o_s = otp_secret` back to the client **once** and records `ts_offset = server_ts - client_ts`.
+- On every subsequent request, the client computes `o_c = md5(f'{current_client_ts}|{otp_secret}')` and includes it in the body.
+- The server takes `client_ts ≈ server_ts - ts_offset`, rounds to the nearest 15-second window, and checks the hash against three consecutive windows (previous, current, next) to absorb clock drift.
+
+```python
+def _verify_otp(session, o_c, req_ts):
+    client_ts = req_ts - session.ts_offset
+    window = int(client_ts // 15)
+    for w in (window - 1, window, window + 1):
+        expected = md5(f'{w * 15}|{session.otp_secret}'.encode()).hexdigest()
+        if expected == o_c:
+            return
+    raise errs.invalid_otp
+```
+
+A leaked `session_id` alone is useless without `otp_secret`; a captured `o_c` is useless after 45 seconds.
+
+## Creating a session
+
+```python
+def _create_user_session_secure(user_id, source_ip, device_info, c_ts, req_ts):
+    session = UserSession(
+        user_id=user_id,
+        source_ip=source_ip,
+        device_info=device_info or DeviceInfo(),
+        use_secure=True,
+        ts_offset=int(req_ts - c_ts) if c_ts else 0,
+    )
+    session.put()
+    return session.id, session
+```
+
+Return value is `(session_id, UserSession)`:
+
+- `session_id` becomes the `session_id` header on every future request.
+- `UserSession.otp_secret` becomes the `o_s` field in the login response (the only time the client sees it).
+
+<Callout type="warn">
+The legacy helper `_create_user_session` (without the `_secure` suffix) returns a hashed token rather than the plain session id. Do not use it for new code — clients written against the secure path will fail to authenticate.
+</Callout>
+
+## Password & SMS-code flow
+
+A typical phone-based auth path:
+
+1. `send_sms_auth_code(phone)` — generates a 6-digit code, stores it (hashed) in `SmsAuthCode` keyed by phone, sends via `api.sms.send_sms(...)`.
+2. `get_sms_auth_token(phone, code)` — verifies the code and returns an opaque short-lived token.
+3. `register(phone, password, auth_token, name, birth, ...)` or `login(phone, password, auth_token)` — verifies the token (single-use) and creates a `UserSession`.
+
+Use `hash_util.hash_password(salt + '|' + password)` for password storage and `hash_util.make_salt()` for per-user salts.
+
+## Retry protection
+
+For password login, keep a small counter in a `PasswordRetry` model (or Locking key, or DynamoDB counter) and reject after N failures within a window. The pattern:
+
+```python
+def login(phone, password, ...):
+    retry = password_retry_service.get_retry_count(phone)
+    if retry >= 5:
+        return {'status': 'failed_by_retry'}
+    ...
+    if not _password_matches(user, password):
+        password_retry_service.increment(phone)
+        return {'status': 'failed'}
+    password_retry_service.reset(phone)
+```
+
+## The no-session whitelist
+
+Some controllers must reach without authentication: register, login, password reset, public read endpoints. Keep an explicit whitelist in the handler:
+
+```python
+NO_SESSION_CMDS = {
+    'main.controller.system.health_check',
+    'main.controller.member.register',
+    'main.controller.member.login',
+    'main.controller.member.send_sms_auth_code',
+    'main.controller.member.get_sms_auth_token',
+    'main.controller.google_auth.google_login',
+    'main.controller.google_auth.google_register',
+    'main.controller.apple_auth.apple_login',
+    'main.controller.apple_auth.apple_register',
+}
+
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    cmd = body.get('cmd')
+    sid = handler_util.get_headers(event, context).get('session_id')
+
+    if not sid and cmd not in NO_SESSION_CMDS:
+        raise errs.no_session
+    ...
+```
+
+Add `errs.no_session` to `ignore_app_errors` on the wrapper so a missing session doesn't page on-call.
+
+## Where to next
+
+<Cards>
+  <Card title="OAuth & social login" href="/docs/auth/oauth">
+    Google/Apple/Kakao login + register two-step pattern.
+  </Card>
+  <Card title="Admin sub-system" href="/docs/auth/admin">
+    AdminManager/AdminGroup, IP filters, cmd whitelists.
+  </Card>
+</Cards>

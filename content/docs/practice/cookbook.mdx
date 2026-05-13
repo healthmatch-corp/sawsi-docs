@@ -1,0 +1,313 @@
+---
+title: Cookbook
+description: Recipes for the dozen most common sawsi tasks — copy, adapt, ship.
+---
+
+A collection of complete, copy-able recipes. Each one assumes you already know the framework basics (see [Mental model](/docs/introduction/mental-model)) and shows the full set of files to touch.
+
+## 1. Add a new DynamoModel
+
+```python title="main/model/post.py"
+from sawsi.model.base import DynamoModel, sync
+import api
+
+@sync
+class Post(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'post'
+    _indexes = [
+        ('author_id', 'crt'),         # author's posts in time order
+        ('category', 'crt'),           # all posts in a category
+    ]
+
+    author_id: str
+    title: str
+    content: str
+    category: str = 'general'
+    is_published: bool = False
+```
+
+Then in `build_keeper.py`:
+
+```python
+sync_all_models([
+    'main.model',
+    'main.model.post',     # if new submodule
+])
+```
+
+Deploy. Table appears.
+
+## 2. Paginate a list
+
+```python title="main/controller/post.py"
+@controller
+def list_my_posts(user, start_key: dict | None = None, **kwargs):
+    if not user:
+        raise errs.no_session
+    items, end_key = Post.query(
+        pk_field='author_id', pk_value=user.id,
+        sk_field='crt', reverse=True,
+        limit=20, start_key=start_key,
+    )
+    return {
+        'items': [p.model_dump() for p in items],
+        'cursor': end_key,
+    }
+```
+
+Client sends `cursor` back as `start_key` on the next request.
+
+## 3. Add a social login provider (Kakao)
+
+Five places to edit:
+
+```python title="main/service/social_auth/kakao_auth.py"
+import requests
+
+def verify_kakao_access_token(access_token):
+    r = requests.get(
+        'https://kapi.kakao.com/v2/user/me',
+        headers={'Authorization': f'Bearer {access_token}'}, timeout=5,
+    )
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    return type('K', (), {
+        'sub': str(data['id']),
+        'name': data.get('properties', {}).get('nickname'),
+        'email': data.get('kakao_account', {}).get('email'),
+    })()
+```
+
+```python title="main/model/user.py"
+# add to _indexes:
+('kakao_social_id', None),
+# add field:
+kakao_social_id: str = ' '
+# add classmethod:
+@classmethod
+def get_user_by_kakao_id(cls, sub):
+    items, _ = cls.query(pk_field='kakao_social_id', pk_value=sub, limit=1)
+    return items[0] if items else None
+```
+
+```python title="main/controller/kakao_auth.py"
+# mirror google_auth.py: kakao_login + kakao_register
+```
+
+```python title="main/aws_handler.py"
+NO_SESSION_CMDS.add('main.controller.kakao_auth.kakao_login')
+NO_SESSION_CMDS.add('main.controller.kakao_auth.kakao_register')
+```
+
+```json title="aws_iam_policy_dev.json (and _prod.json)"
+// already covered by the {env}/{project}* Secrets Manager pattern
+// add the kakao keys to Secrets Manager itself
+```
+
+See [OAuth & social login](/docs/auth/oauth) for the deep walkthrough.
+
+## 4. SQS background job
+
+```python title="main/service/post_service.py"
+def publish_async(post_id):
+    import json, api
+    api.sqs.send_message(json.dumps({
+        'type': 'queue_receiver.controller.post_publisher.run',
+        'body': {'post_id': post_id},
+    }))
+```
+
+```python title="queue_receiver/controller/post_publisher.py"
+from sawsi.handler.controller_decorator import controller
+from main.model.post import Post
+
+@controller
+def run(post_id: str, **kwargs):
+    post = Post.get(post_id)
+    if not post or post.is_published:
+        return
+    # do the heavy work — fan out to followers, etc.
+    post.is_published = True
+    post.update()
+```
+
+The queue worker (`queue_receiver/aws_handler.py`) routes messages by `type` automatically.
+
+## 5. Scheduled job
+
+```python title="scheduler/aws_handler.py (add to existing handler)"
+with ScheduledTask('0 0 * * *') as do:   # daily at UTC 00:00 = KST 09:00
+    from scheduler.controller import daily_digest
+    do(daily_digest.run)
+```
+
+```python title="scheduler/controller/daily_digest.py"
+from sawsi.handler.controller_decorator import controller
+import api, time
+
+@controller
+def run(**kwargs):
+    # be idempotent — use a lock so EventBridge double-fires don't re-run
+    key = time.strftime('daily_digest-%Y-%m-%d')
+    try:
+        with api.locking.lock(key, max_alive_ts=600, max_retries=1):
+            _send_digests()
+    except RuntimeError:
+        pass   # already running in another invocation
+```
+
+## 6. WebSocket push
+
+```python title="main/service/notification_service.py"
+def notify_user_realtime(user_id, payload):
+    import api, json
+    from main.model.ws_connection import WsConnection
+    for conn in WsConnection.generate(pk_field='user_id', pk_value=user_id):
+        try:
+            api.apigw.post_to_connection(
+                data=json.dumps(payload),
+                connection_id=conn.connection_id,
+            )
+        except Exception:
+            conn.delete()   # stale connection
+```
+
+The `WsConnection` model is populated by `websocket_receiver/aws_handler.py` on `$connect`.
+
+## 7. Inbound webhook (Apple Server Notification)
+
+```python title="webhook_receiver/aws_handler.py (route)"
+# already routes by querystring cmd
+```
+
+```python title="webhook_receiver/controller/apple_subscription.py"
+import jwt
+from sawsi.handler.controller_decorator import controller
+import api
+
+@controller
+def apple_update_subscription(headers: dict, raw_body: str, **kwargs):
+    payload = jwt.decode(raw_body, options={'verify_signature': False})
+    # verify against Apple's public keys (omitted for brevity)
+    # update the user's subscription state in DynamoDB
+    ...
+    return {'ok': True}
+```
+
+Request URL: `POST https://<api-gw>/?cmd=webhook_receiver.controller.apple_subscription.apple_update_subscription`
+
+## 8. New admin command
+
+```python title="admin/controller/user_admin.py"
+from sawsi.handler.controller_decorator import controller
+from main.model.user import User
+
+@controller
+def freeze_user(me, user_id: str, **kwargs):
+    user = User.get(user_id)
+    if not user:
+        raise errs.no_such_user
+    user.is_frozen = True
+    user.update()
+    api.firehose_log.put_record(json.dumps({
+        'admin_id': me.id, 'action': 'freeze_user', 'user_id': user_id, 'ts': time.time(),
+    }))
+    return {'ok': True}
+```
+
+Add the cmd to the appropriate `AdminGroup.allow_cmds` (via the admin UI) or to `ROOT_ONLY_CMDS` if it's destructive.
+
+## 9. Bedrock + VectorKB
+
+```python title="main/service/qa_service.py"
+import api, json
+
+def answer_question(question: str) -> str:
+    candidates = api.vector_kb.search(question, top_k=5)
+    context = '\n'.join(c['text'] for c in candidates)
+    resp = api.bedrock.converse(
+        model_id='anthropic.claude-haiku-4-5-20251001',
+        system='Answer using only the provided context. If unknown, say so.',
+        messages=[{
+            'role': 'user',
+            'content': [{'text': f'Context:\n{context}\n\nQuestion: {question}'}],
+        }],
+        max_tokens=512,
+        temperature=0.0,
+    )
+    return resp['output']['message']['content'][0]['text']
+```
+
+## 10. Korean autocomplete with SearchEngine
+
+```python title="api.py"
+from sawsi.service.searchengine import SearchEngine
+post_search = LazyLoadedAPI(SearchEngine, dynamo_db_api=...)  # see SearchEngine ctor
+
+# build_keeper.py
+post_search.init_table()
+```
+
+```python title="main/service/post_service.py"
+def create_post(...):
+    post = Post(...)
+    post.put()
+    api.post_search.put_data(item_id=post.id, text=post.title)
+```
+
+```python title="main/controller/post.py"
+@controller
+def autocomplete(query: str, **kwargs):
+    results = api.post_search.search(query)
+    return {'results': results[:10]}
+```
+
+## 11. Add a new public S3 bucket
+
+```python title="api.py"
+s3_archives = LazyLoadedAPI(S3API, f'{env}-{project_name}-archives', region=region)
+```
+
+```python title="build_keeper.py"
+api.s3_archives.init_s3_bucket(acl='private')
+```
+
+```json title="aws_iam_policy_dev.json (AND _prod.json)"
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+  "Resource": [
+    "arn:aws:s3:::dev-myproject*",
+    "arn:aws:s3:::dev-myproject*/*"
+  ]
+}
+// (covered by the existing wildcard, but if you scoped more tightly add an explicit ARN)
+```
+
+Deploy. Bucket appears.
+
+## 12. Critical section with distributed locking
+
+```python title="main/controller/event.py"
+@controller
+def join_event(user, event_id: str, **kwargs):
+    try:
+        with api.locking.lock(f'join_event:{event_id}', max_alive_ts=10, max_retries=3, wait_time=1):
+            event = Event.get(event_id)
+            if event.participant_count >= event.max_participant_count:
+                raise errs.exceed_max_participant_count
+            event.participant_count += 1
+            event.update()
+            # also write a participant row, etc.
+    except RuntimeError:
+        raise errs.try_again_later
+    return {'ok': True}
+```
+
+The lock prevents two simultaneous joins from both passing the capacity check.
+
+## More
+
+These twelve cover the most common asks. For migrations (adding a GSI, renaming a field, moving None → ' ', etc.), see [Migration recipes](/docs/practice/migration).

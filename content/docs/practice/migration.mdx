@@ -1,0 +1,259 @@
+---
+title: Migration recipes
+description: Schema, field, and code migrations — how to change running sawsi systems without an outage.
+---
+
+DynamoDB is schemaless, but `DynamoModel` adds enough structure that a few migrations need careful sequencing. This page walks the most common ones.
+
+## 1. Add a new field with a default
+
+The easy case. Just edit the model:
+
+```python
+class User(DynamoModel):
+    ...
+    # new field
+    timezone: str = 'Asia/Seoul'
+```
+
+Deploy. Existing rows have the missing attribute; `User.get(...)` reads them, Pydantic applies the default, and they look like they always had it.
+
+**Caveat — back-filling defaults you want to *write back* to DynamoDB:**
+
+```python
+user = User.get(user_id)
+# user.timezone is 'Asia/Seoul' (default), but DynamoDB has no attribute
+user.update()
+# this is a NO-OP — no field was modified
+user.update(force_update_default_fields=True)
+# now timezone is written
+```
+
+If your code reads `timezone` and expects it to be present in DynamoDB, run a one-shot migration:
+
+```python title="main/migration/20260513_backfill_timezone.py"
+from main.model.user import User
+for u in User.generate(limit=1000):
+    u.timezone = u.timezone   # mark as modified
+    u.update()
+```
+
+## 2. Add a new GSI
+
+Edit the model:
+
+```python
+class User(DynamoModel):
+    _indexes = [
+        ('phone', None),
+        ('email', None),               # NEW
+    ]
+```
+
+On next deploy, `build_keeper.py` calls `sync_all_models` which detects the missing index and creates it. DynamoDB's GSI creation is **online** — existing rows are back-filled into the index, and the table remains queryable during the process.
+
+**Two caveats:**
+
+- GSI creation can take minutes to hours for large tables. Plan deploy timing if reads against the new index are critical.
+- During back-fill, queries against the GSI may return incomplete results. Add the GSI in a deploy, wait, then ship the code that uses it.
+
+## 3. Convert a None field to sparse `' '`
+
+You have an existing field declared `Optional[str] = None`, you've discovered it's a GSI key (or wants to be), and you need to convert.
+
+Steps:
+
+1. Change the field default and type in the model:
+
+   ```python
+   # before
+   invite_code: Optional[str] = None
+   # after
+   invite_code: str = ' '
+   ```
+
+2. Update any place that **reads** the field to use `.strip()`:
+
+   ```python
+   # before
+   if user.invite_code:
+       ...
+   # after
+   if user.invite_code.strip():
+       ...
+   ```
+
+3. Override `put()` / `update()` to **strip None** before writing — this guards future bugs:
+
+   ```python
+   def put(self, can_overwrite=False):
+       self.validate_model(self)
+       item = {k: v for k, v in self.model_dump().items() if v is not None}
+       self.__dynamo__.put_item(self._table_name(), item, can_overwrite)
+       return self
+   ```
+
+4. Back-fill existing rows:
+
+   ```python title="main/migration/20260513_invite_code_sparse.py"
+   from main.model.user import User
+   for u in User.generate(limit=1000):
+       if u.invite_code is None or u.invite_code == '':
+           u.invite_code = ' '
+           u.update(force_update_default_fields=True)
+   ```
+
+5. Add the GSI in the same deploy (or a follow-up):
+
+   ```python
+   _indexes = [..., ('invite_code', None)]
+   ```
+
+## 4. Rename a model field
+
+DynamoDB stores attribute names, not positions, so renaming requires a copy:
+
+```python
+class User(DynamoModel):
+    description: str = ''     # old name
+    bio: str = ''             # new name
+```
+
+Migration:
+
+```python
+for u in User.generate(limit=1000):
+    if u.description and not u.bio:
+        u.bio = u.description
+        u.description = ''
+        u.update()
+```
+
+After verifying, remove the old field from the model and run a cleanup pass to remove the attribute from DynamoDB (DynamoDB requires an explicit `REMOVE` clause; the simplest path is `u.description = None` + a `put`/`update` override that drops `None` keys).
+
+## 5. Split a model into two
+
+Common when a row grows too many fields and queries get unwieldy.
+
+Steps:
+
+1. Define the new model:
+
+   ```python
+   class UserProfile(DynamoModel):
+       __dynamo__ = api.dynamo
+       _table = 'user_profile'
+       _indexes = [('user_id', None)]
+       user_id: str
+       avatar_url: str = ''
+       bio: str = ''
+       interests: list[str] = []
+   ```
+
+2. Migration to copy the relevant fields from `User`:
+
+   ```python
+   for u in User.generate(limit=1000):
+       up = UserProfile(user_id=u.id, avatar_url=u.avatar_url, bio=u.bio, interests=u.interests)
+       up.put()
+   ```
+
+3. Update services to read from `UserProfile`:
+
+   ```python
+   def get_user_profile(user_id):
+       items, _ = UserProfile.query(pk_field='user_id', pk_value=user_id, limit=1)
+       return items[0] if items else None
+   ```
+
+4. Keep the fields on `User` for a while as a fallback during rollout, then remove in a follow-up.
+
+## 6. Change a `_table` name
+
+Avoid if possible — DynamoDB tables don't rename. The workaround is to define a new model with the new table name, migrate, then remove the old.
+
+If you must:
+
+1. Define `UserV2` pointing at `user_v2`.
+2. Migrate every row from `User` to `UserV2`.
+3. Cut all reads/writes over to `UserV2`.
+4. Eventually drop the old `User` model and the old table.
+
+Plan for this taking a release cycle at minimum.
+
+## 7. Drop a model
+
+```python
+# In the model file:
+# (remove the @sync decorator and the class itself)
+```
+
+`sync_all_models` won't ever re-create the table. The existing table in DynamoDB stays until you delete it manually (the framework deliberately doesn't drop tables on undefine).
+
+For active cleanup:
+
+```bash
+aws dynamodb delete-table --table-name dev-myproject_user_v1
+```
+
+Be sure no Lambda is still reading from it before issuing this command.
+
+## 8. Add a new error code without renumbering old ones
+
+```python title="errs.py"
+err_n = 1
+def auto(category):
+    global err_n
+    n = err_n
+    err_n += 1
+    return f'{category}{n:04d}'
+
+# Existing — DO NOT REORDER
+no_session         = AppError(auto('S'), 'no_session')         # S0001
+invalid_session    = AppError(auto('S'), 'invalid_session')    # S0002
+...
+
+# NEW errors go at the bottom
+new_error          = AppError(auto('S'), 'new_error')          # S0063
+```
+
+Once a code is assigned, it must stay. Reordering breaks clients that handle specific codes.
+
+## 9. Promote a feature from dev-only to prod
+
+The default sawsi pattern is that anything in `if config.env == 'dev':` is dev-only. To promote:
+
+1. Remove the `if config.env == 'dev':` guard.
+2. Ensure `aws_iam_policy_prod.json` has the permissions the feature needs.
+3. Ensure all required Secrets exist in `prod/myproject`.
+4. Ensure any new buckets / tables / queues / GSIs have been deployed at least once to prod (often, dev deploys this via `build_keeper.py` first; prod's first deploy after the change picks it up).
+
+## 10. Roll back
+
+`update-function-code --image-uri <old-tag>` is reversible.
+
+What is NOT reversible by code rollback:
+
+- DynamoDB tables created.
+- GSIs created (rollback leaves them in place).
+- S3 buckets created.
+- Firehose streams created.
+- Schema changes (added fields stay added).
+
+The rule is **forward-only schema**: code can move backward, schema can only move forward. If you need to undo a schema change, do another forward migration that walks it back, not a rollback.
+
+## 11. The breaking-change two-step
+
+When a change cannot be backward-compatible (rare in DynamoDB, common in cmd signatures):
+
+1. **Deploy 1**: ship both the old and new behavior, controlled by a feature flag in Secrets Manager or a Variable model.
+2. **Switch clients over**: roll out new mobile/web clients that use the new cmd.
+3. **Deploy 2**: remove the old behavior.
+
+The cost of this two-step is one extra deploy. The cost of not doing it is angry users on the old client version.
+
+## What this is *not*
+
+- Not a tool. There's no `awsi migrate` command. Migrations are Python scripts in `main/migration/` that you run manually (locally or via a one-shot Lambda).
+- Not transactional. DynamoDB doesn't have transactions across many rows. Plan migrations to be idempotent so partial completion is safe.
+- Not a substitute for thinking. Each migration plan should be reviewed end-to-end before deploy.

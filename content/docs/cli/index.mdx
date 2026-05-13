@@ -1,0 +1,119 @@
+---
+title: The awsi CLI
+description: Scaffolding new projects and new Lambda triggers with awsi init and awsi add.
+---
+
+When you `pip install sawsi`, the `awsi` command is registered on your PATH. It does exactly two things — scaffold a new project and add a new Lambda trigger to an existing project — and the rest of the framework is just the code those commands generate.
+
+## `awsi init <project> <app>`
+
+```bash
+awsi init myproject main
+```
+
+This populates the **current directory** with:
+
+| File | Purpose |
+|---|---|
+| `api.py` | Singleton pool of AWS service clients |
+| `config.py` | Reads `env` from environment, sets region and the `build` flag |
+| `errs.py` | App-specific `AppError` instances |
+| `build_keeper.py` | Resource-init script that runs at deploy time |
+| `requirements.txt` | Python dependencies (sawsi pinned, others empty) |
+| `Dockerfile` | Container image used by Lambda |
+| `buildspec-lambda-{dev,prod}.yml` | CodeBuild specs for zip-based deploys |
+| `buildspec-docker-{dev,prod}.yml` | CodeBuild specs for container-image deploys |
+| `aws_iam_policy_{dev,prod}.json` | IAM policy templates scoped by env prefix |
+| `<app>/` | A first Lambda app — `aws_handler.py`, `controller/`, `service/`, `model/` |
+
+Internally the CLI copies files from the `sawsi_boilerplate/` directory inside the installed package and runs string substitution: `{{project}}` is replaced with the project name (used in IAM ARNs, secret paths, etc.) and `{{app}}` with the app name (used in handler imports, the cmd prefix, etc.).
+
+<Callout>
+The CLI does **not** overwrite existing files. If you run `awsi init` in a populated directory, only missing files are created. This makes it safe to re-run if you want to recover a deleted boilerplate file.
+</Callout>
+
+## `awsi add <app> -t <trigger>`
+
+```bash
+awsi add queue_receiver -t sqs
+```
+
+Adds a new Lambda app directory to an existing project. The `-t` flag picks the handler skeleton.
+
+| Trigger | Flag | Event source |
+|---|---|---|
+| API Gateway REST | `-t agw` (default) | HTTP request, routes by `body['cmd']` |
+| SQS | `-t sqs` | Queue messages, routes by `body['type']` |
+| EventBridge Scheduler | `-t ebs` | Periodic invocation (typically every minute), runs cron-matched `ScheduledTask` blocks |
+| WebSocket | `-t ws` | `$connect`/`$disconnect`/`$default` from API Gateway WebSocket |
+| Webhook receiver | `-t webhook` | Inbound HTTPS POST, routes by querystring `cmd` |
+
+Each generated `aws_handler.py` is shaped for its event source, but the **inner pattern** is the same: extract relevant fields from `event`, then call `router(cmd, body, headers, allowed_cmd_prefixes=['<app>.controller'])` (or, for the scheduler, run a series of `ScheduledTask(cron) with do(...)` blocks).
+
+See [Triggers](/docs/handlers/triggers) for the full per-trigger event shape, body conventions, and gotchas.
+
+## Template variables
+
+The CLI substitutes two tokens during file copy:
+
+| Token | Replaced with | Used in |
+|---|---|---|
+| `{{project}}` | First positional argument to `init` | `api.py` resource names, `aws_iam_policy_*.json` ARNs, `secret_manager` path |
+| `{{app}}` | Second positional argument to `init` (or the only argument to `add`) | `aws_handler.py` imports, controller `cmd` prefix, Dockerfile `CMD` |
+
+If you ever need to rename a project or an app, do **find-and-replace across these tokens** rather than editing files individually — they appear in many places (Dockerfile, buildspec, IAM, build_keeper).
+
+## What the CLI does **not** do
+
+`awsi` only generates source files. It does not:
+
+- Create the ECR repository (you need to create it once via console or `aws ecr create-repository`).
+- Create the Lambda function (you need to create the function shell pointing at the ECR image — see [Deployment](/docs/deployment/deployment)).
+- Wire the trigger to the Lambda function (API Gateway route, SQS event-source mapping, EventBridge rule — all manual setup).
+- Update IAM policies after `awsi add` (you must add the new function's needs to `aws_iam_policy_{env}.json` yourself).
+
+These are AWS-account operations that the CLI deliberately keeps out of its scope. The boilerplate is the **code**; the AWS scaffold is your operation.
+
+## Anatomy of the boilerplate
+
+The full inventory of files the CLI generates and what each does:
+
+```
+sawsi_boilerplate/                       (template)
+├── api.py                               → your AWS resource singletons
+├── config.py                            → reads env, region; sets build flag
+├── errs.py                              → app-specific AppError definitions
+├── build_keeper.py                      → run-once-per-deploy initialization
+├── requirements.txt                     → pip dependencies
+├── Dockerfile                           → Lambda container image
+├── buildspec-lambda-{dev,prod}.yml      → zip-based CodeBuild
+├── buildspec-docker-{dev,prod}.yml      → container-based CodeBuild
+├── aws_iam_policy_{dev,prod}.json       → IAM policy templates
+└── {{app}}/
+    ├── __init__.py
+    ├── aws_handler.py                   → Lambda entrypoint (varies by -t)
+    ├── local_server.py                  → Flask adapter (-t agw only)
+    ├── doc_maker.py                     → DocMaker integration
+    ├── controller/
+    │   ├── __init__.py
+    │   └── auth.py                      → @controller examples
+    ├── service/
+    │   └── auth_service.py              → business logic
+    └── model/
+        ├── __init__.py
+        └── sample_user.py               → DynamoModel example
+```
+
+Every file is small enough to read in one sitting. Read them after `awsi init` — they are part of the framework's documentation.
+
+## Versioning
+
+The CLI version follows the library version. `sawsi==20.10` ships `awsi` 20.10. There is no separate CLI release channel.
+
+To upgrade:
+
+```bash
+pip install -U sawsi
+```
+
+Re-running `awsi init` on an existing project is safe and will refresh missing files only. For *updating* existing files after an upgrade, compare against the latest `sawsi_boilerplate/` inside the new package and merge manually.

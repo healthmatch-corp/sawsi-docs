@@ -1,0 +1,243 @@
+---
+title: IAM
+description: Least-privilege policies scoped by env prefix, per-service permission templates, and the dev/prod parity rule.
+---
+
+The IAM policy attached to your Lambda execution role is the single most important security boundary in a sawsi project. This page is the reference for what to put in it and how to keep it in sync across environments.
+
+## The structure
+
+```json title="aws_iam_policy_dev.json (skeleton)"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "DynamoDB",        "Effect": "Allow", "Action": ["dynamodb:*Item", "dynamodb:Query", ...], "Resource": ["arn:aws:dynamodb:*:*:table/dev-myproject*", "arn:aws:dynamodb:*:*:table/dev-myproject*/index/*"] },
+    { "Sid": "S3",              "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", ...],     "Resource": ["arn:aws:s3:::dev-myproject*", "arn:aws:s3:::dev-myproject*/*"] },
+    { "Sid": "SecretsManager",  "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],         "Resource": ["arn:aws:secretsmanager:*:*:secret:dev/myproject*"] },
+    { "Sid": "Firehose",        "Effect": "Allow", "Action": ["firehose:PutRecord", "firehose:PutRecordBatch"], "Resource": ["arn:aws:firehose:*:*:deliverystream/dev-myproject*"] },
+    { "Sid": "SES",             "Effect": "Allow", "Action": ["ses:SendEmail", "ses:SendRawEmail"],     "Resource": "*" },
+    { "Sid": "SQS",             "Effect": "Allow", "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"], "Resource": ["arn:aws:sqs:*:*:dev_myproject*"] },
+    { "Sid": "Logs",            "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": "*" },
+    { "Sid": "XRay",            "Effect": "Allow", "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords"], "Resource": "*" }
+  ]
+}
+```
+
+The key idea: every ARN that names a resource is **scoped by env prefix** (`dev-myproject*`, `dev/myproject*`, `dev_myproject*`). Production gets a parallel file with `prod-` instead.
+
+## Why scope by prefix
+
+Two reasons:
+
+1. **Blast radius.** A bug or compromise in dev can read dev tables but cannot touch prod data — the IAM principal literally lacks permission.
+2. **No noisy neighbors.** Other projects in the same AWS account, even if their Lambdas use a shared role somehow, can't accidentally read your tables.
+
+The prefix is the same one your `api.py` uses to name resources — that's why the [Mental model](/docs/introduction/mental-model) chapter calls it "load-bearing."
+
+## Service-by-service permission set
+
+### DynamoDB
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+    "dynamodb:Query", "dynamodb:Scan",
+    "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem",
+    "dynamodb:DescribeTable", "dynamodb:CreateTable", "dynamodb:UpdateTable", "dynamodb:UpdateTimeToLive",
+    "dynamodb:CreateGlobalSecondaryIndex", "dynamodb:UpdateGlobalSecondaryIndex"
+  ],
+  "Resource": [
+    "arn:aws:dynamodb:*:*:table/dev-myproject*",
+    "arn:aws:dynamodb:*:*:table/dev-myproject*/index/*"
+  ]
+}
+```
+
+`CreateTable` and `*Index` are needed only by the CodeBuild role (running `build_keeper.py`). For the runtime Lambda role you can drop them — but most projects use a single role for simplicity.
+
+### S3
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+    "s3:ListBucket", "s3:PutObjectAcl",
+    "s3:CreateBucket", "s3:PutBucketAcl"
+  ],
+  "Resource": [
+    "arn:aws:s3:::dev-myproject*",
+    "arn:aws:s3:::dev-myproject*/*"
+  ]
+}
+```
+
+`CreateBucket` and `PutBucketAcl` are again CodeBuild-only (for `init_s3_bucket()`). Runtime drops them.
+
+If you have a bucket with a non-conforming name (e.g. an existing legacy bucket), add a separate statement for it. Don't break the env-prefix discipline by widening to `s3:::*`.
+
+### Secrets Manager
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["secretsmanager:GetSecretValue"],
+  "Resource": ["arn:aws:secretsmanager:*:*:secret:dev/myproject*"]
+}
+```
+
+Note the path separator is `/` (not `-`) for Secrets Manager. `api.py` uses `f'{env}/{project}'` for this exact reason.
+
+### Firehose
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["firehose:PutRecord", "firehose:PutRecordBatch"],
+  "Resource": ["arn:aws:firehose:*:*:deliverystream/dev-myproject*"]
+}
+```
+
+For CodeBuild (to run `firehose_log.init()`), also include `firehose:CreateDeliveryStream`, `iam:PassRole`, and the IAM permissions to create the role the stream uses. Keep these in a CodeBuild-only policy if you can — the runtime Lambda doesn't need them.
+
+### SES / SMS / SNS
+
+```json
+{
+  "Sid": "SES",
+  "Effect": "Allow",
+  "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+  "Resource": "*"
+},
+{
+  "Sid": "SNS",
+  "Effect": "Allow",
+  "Action": ["sns:Publish"],
+  "Resource": "*"
+}
+```
+
+These have no useful resource ARN scoping — verification happens at the identity level (SES) or the account level (SNS phone-number caps).
+
+### SQS
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"],
+  "Resource": ["arn:aws:sqs:*:*:dev_myproject*"]
+}
+```
+
+The queue ARN uses `_` rather than `-` in some sawsi projects — match what your queues actually use. Keep the prefix env-scoped either way.
+
+### Lambda client (for cross-Lambda invokes)
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["lambda:InvokeFunction"],
+  "Resource": ["arn:aws:lambda:*:*:function:dev_myproject_*"]
+}
+```
+
+Only needed if some Lambda calls another via `api.lambda_client.invoke()`. If you only use SQS for fan-out, you can drop this.
+
+### CloudWatch Logs
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+  "Resource": "*"
+}
+```
+
+The Lambda execution role normally has these by default. If you're starting from a custom role, add them explicitly.
+
+### X-Ray (optional)
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords"],
+  "Resource": "*"
+}
+```
+
+### API Gateway Management (WebSocket push)
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["execute-api:ManageConnections"],
+  "Resource": ["arn:aws:execute-api:*:*:<ws-api-id>/*"]
+}
+```
+
+Replace `<ws-api-id>` with your WebSocket API id. This is one of the few resources you cannot prefix-match cleanly.
+
+### Bedrock
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["bedrock:InvokeModel", "bedrock:Converse"],
+  "Resource": [
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-*",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6-*",
+    "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:*"
+  ]
+}
+```
+
+List exactly the models you intend to call. If you onboard a new model, update the policy.
+
+## The dev/prod parity rule
+
+**Whenever you edit `aws_iam_policy_dev.json`, edit `aws_iam_policy_prod.json` in the same commit.**
+
+The most common deployment incident in sawsi projects is "the first prod deploy after a dev feature fails with AccessDenied" because someone updated dev policy and forgot prod. Two safeguards:
+
+1. **Diff the files in code review.** They should look structurally identical, with only `dev-` / `dev_` / `dev/` replaced by `prod-` / `prod_` / `prod/`.
+2. **Use a single script that generates both.** Some teams keep `aws_iam_policy.template.json` and render two outputs with `sed`. Worth doing once you've had the incident twice.
+
+## Per-function roles
+
+For very security-sensitive setups, give each Lambda its own role with only the permissions it needs:
+
+- `main_role`: DynamoDB read+write, S3 read+write to public bucket, Secrets, Firehose, SQS:SendMessage.
+- `admin_role`: superset of `main_role`, plus broader DynamoDB writes for admin tooling.
+- `worker_role`: DynamoDB read+write, SQS:Receive+Delete, no SES, no S3 public.
+
+Most projects start with one shared role and split only when an audit requires it.
+
+## CodeBuild role vs Lambda execution role
+
+These are **two different roles**:
+
+| Role | What it does |
+|---|---|
+| CodeBuild service role | Builds the image, pushes to ECR, runs `aws lambda update-function-*`. Needs broad infrastructure permissions including `lambda:UpdateFunction*` and `ecr:*` on the right repo. |
+| Lambda execution role | The role the Lambda assumes at runtime. Needs only what the application actually reads/writes. |
+
+Don't conflate them. The CodeBuild role can be wide (it runs in CI, not in user-traffic). The Lambda execution role must be tight.
+
+## Auditing your policy
+
+A quick checklist when reviewing a policy diff:
+
+```
+[ ] All resource ARNs include the env prefix (no bare wildcards on resources)
+[ ] dev and prod files differ only in the env prefix
+[ ] New AWS services used in this PR are reflected in the policy
+[ ] Actions are not broader than needed (`s3:*` is rare; usually specific verbs)
+[ ] No principal-side "Allow *" (e.g. don't grant via Resource: "*" unless the action requires it)
+```
+
+## What this is *not*
+
+- Not a tutorial on AWS IAM in general. There are many AWS resources on least-privilege design — this page covers what sawsi specifically needs.
+- Not a substitute for trying it. Deploy to dev, watch CloudWatch for AccessDenied, iterate.

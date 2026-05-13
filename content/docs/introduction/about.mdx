@@ -1,0 +1,61 @@
+---
+title: What is sawsi
+description: A Python framework for AWS Lambda backends that bakes in conventions instead of configuration.
+---
+
+## The one-line answer
+
+sawsi is a Python framework for building AWS-native serverless backends. It gives you a `cmd`-based router, a DynamoDB ORM, a uniform set of AWS service wrappers, and a container-image deployment flow — all stitched together by a small number of strong conventions.
+
+## What problem it solves
+
+Every Lambda-on-AWS project independently re-discovers the same six things:
+
+1. **How requests get routed** — usually a hand-rolled `if cmd == ...` chain that grows into a thousand-line handler.
+2. **How DynamoDB items are modeled** — raw `boto3.client('dynamodb').put_item(...)` calls scattered through the codebase.
+3. **How AWS clients are constructed** — `boto3.client('s3')` inside every function, each one paying cold-start cost.
+4. **How secrets are loaded** — one team caches in memory, another hits Secrets Manager on every request.
+5. **How a release initializes resources** — creating GSIs by hand in the console, drifting between dev and prod.
+6. **How environments are separated** — guessing whether to add an `if env == 'prod'` here or a different bucket name there.
+
+sawsi takes a stance on all six. The stance is sometimes minor (a wrapper class, a naming convention) and sometimes load-bearing (the entire request lifecycle, the DynamoModel ORM), but it is **always the same stance across every project**, which is what makes the framework useful.
+
+## What it is not
+
+- **Not a REST framework.** sawsi rejects path-based routing entirely. A single API Gateway endpoint accepts a JSON body containing `{"cmd": "main.controller.user.get_profile", ...}` and the router dispatches by Python module path. No path variables, no method matching.
+- **Not a multi-cloud abstraction.** Every wrapper is AWS-specific. The point is not portability — it is to make AWS-flavored code coherent.
+- **Not an async framework.** Handlers are synchronous Python functions. Concurrency, when needed, comes from `ThreadPoolExecutor` inside SQS workers or from Lambda's own scaling.
+
+## How it compares
+
+| | sawsi | Chalice | Zappa | Serverless Framework |
+|---|---|---|---|---|
+| Routing | `cmd` JSON | path decorators | path decorators | path / event maps |
+| Data layer | DynamoModel ORM | none | none | none |
+| AWS clients | `api.py` singletons via `LazyLoadedAPI` | per-call | per-call | per-call |
+| Deploy | Docker → ECR → Lambda update | `chalice deploy` zip | `zappa deploy` zip | `sls deploy` zip/container |
+| Multi-trigger fleet | first-class (`awsi add -t ...`) | one app per project | one app per project | yes |
+| Opinion strength | high (conventions) | medium | medium | low |
+
+## When to use it
+
+Reach for sawsi if **at least three** of the following are true:
+
+- DynamoDB is your primary store and you have more than two tables.
+- You need more than one Lambda (API Gateway + a worker, or several triggers).
+- You ship `dev` and `prod` from the same codebase and need them strictly isolated.
+- You want a single place that lists every AWS resource your app touches.
+- You want new endpoints to land as one decorated function, not a routing-table edit.
+
+## When not to use it
+
+- You're building a single-function utility Lambda. The boilerplate is not worth it.
+- Your data layer is Postgres or another RDBMS. The DynamoModel chapters won't apply, and the rest of the framework leans on `api.dynamo` being present.
+- You want to be portable across clouds.
+- You want async/await as your primary concurrency model.
+
+## What you should read next
+
+- If you have not written any sawsi code yet → [Getting started](/docs/introduction/getting-started).
+- If you have skeleton code and want to understand the shapes → [Mental model](/docs/introduction/mental-model).
+- If you want to scaffold a real project → [The `awsi` CLI](/docs/cli).

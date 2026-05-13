@@ -1,0 +1,243 @@
+---
+title: OAuth & social login
+description: The two-step login/register pattern with id_token verification and sparse social_id GSIs.
+---
+
+sawsi standardizes OAuth/social login into a **two-step pattern**: one cmd to attempt sign-in, and a separate cmd to complete sign-up if the user is new. The shape is identical across Google, Apple, Kakao, etc. — only the verification layer differs.
+
+## The two-step contract
+
+| Step | cmd | Input | Output |
+|---|---|---|---|
+| 1 | `{provider}_login` | `id_token` (+ source ip, device info) | `'succeed'` with session, or `'need_register'` with extracted profile fields |
+| 2 | `{provider}_register` | `id_token` + the missing profile fields (`name`, `birth`, …) | `'succeed'` with new session, or `'already_registered'` |
+
+The client flow:
+
+1. Open the platform OAuth sheet, get an `id_token`.
+2. Call `{provider}_login`. If `status === 'succeed'`, you're done.
+3. If `status === 'need_register'`, show a sign-up form pre-filled with whatever the server returned, then call `{provider}_register` with the rest.
+
+Both endpoints are in the no-session whitelist.
+
+## Why status strings, not AppError
+
+A new user is **not** an error — it's a routine outcome. Raising `AppError` would put it in the alert pipe, force the client to handle non-200 responses, and conflate authentication failure with first-time sign-up.
+
+So the controllers return `{'status': 'need_register' | 'succeed' | 'already_registered' | 'invalid_token', ...}` and the client branches on `status`.
+
+## Where to touch
+
+To add a new provider you typically edit **five** places:
+
+1. `service/social_auth/{provider}_auth.py` — id_token verification.
+2. `controller/{provider}_auth.py` — the two controllers.
+3. `model/user.py` — a new `{provider}_social_id` field + a new GSI + a helper class method.
+4. `aws_handler.py` — add the two new cmds to the no-session whitelist.
+5. AWS Secrets Manager — register the client_id / signing key for the provider in `{env}/{project}`.
+
+## 1. id_token verification
+
+### Google
+
+Google issues a JWT but the easiest verification is the `tokeninfo` HTTPS endpoint:
+
+```python title="service/social_auth/google_auth.py"
+import requests
+
+GOOGLE_CLIENT_IDS_IOS = '...'
+GOOGLE_CLIENT_IDS_ANDROID = '...'
+GOOGLE_CLIENT_IDS_WEB = '...'
+
+def verify_google_id_token(id_token):
+    r = requests.get(
+        'https://oauth2.googleapis.com/tokeninfo',
+        params={'id_token': id_token},
+        timeout=5,
+    )
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if data.get('aud') not in {GOOGLE_CLIENT_IDS_IOS, GOOGLE_CLIENT_IDS_ANDROID, GOOGLE_CLIENT_IDS_WEB}:
+        return None
+    if data.get('email_verified') != 'true':           # NB: string, not bool
+        return None
+    return type('GoogleInfo', (), {
+        'sub': data['sub'],
+        'email': data.get('email'),
+        'name': data.get('name'),
+    })()
+```
+
+Two gotchas:
+
+- `aud` claim must match **one of** the iOS/Android/Web client IDs — never just one. Mobile sign-in produces a different `aud` than web.
+- `email_verified` comes back as a string `'true'`, not a boolean. `data['email_verified'] == True` is **always false**.
+
+### Apple
+
+Apple uses standard JWT signed with rotating Apple public keys.
+
+```python title="service/social_auth/apple_auth.py"
+import jwt
+import requests
+
+APPLE_KEYS_CACHE = {}     # module-level cache; lives for Lambda container lifetime
+APPLE_BUNDLE_IDS = ['com.your.app', 'com.your.app.dev']
+
+def _load_apple_keys():
+    if APPLE_KEYS_CACHE:
+        return APPLE_KEYS_CACHE
+    keys = requests.get('https://appleid.apple.com/auth/keys').json()['keys']
+    for k in keys:
+        APPLE_KEYS_CACHE[k['kid']] = jwt.algorithms.RSAAlgorithm.from_jwk(k)
+    return APPLE_KEYS_CACHE
+
+def verify_apple_id_token(id_token):
+    headers = jwt.get_unverified_header(id_token)
+    public_key = _load_apple_keys().get(headers['kid'])
+    if not public_key:
+        return None
+    try:
+        claims = jwt.decode(id_token, public_key, algorithms=['RS256'], audience=APPLE_BUNDLE_IDS)
+    except jwt.PyJWTError:
+        return None
+    return type('AppleInfo', (), {
+        'sub': claims['sub'],
+        'email': claims.get('email'),
+    })()
+```
+
+Two gotchas:
+
+- `aud` is the bundle id, and you must allow **both** dev and prod bundle ids if you ship them as separate apps.
+- Apple does **not** include the user's name in the id_token. The client gets the name once, on the very first Apple sign-in, and must send it as a separate `user_name` parameter to `apple_register`.
+
+## 2. User model — sparse social_id GSI
+
+```python
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [
+        ('phone', None),
+        ('google_social_id', None),
+        ('apple_social_id', None),
+        ('kakao_social_id', None),
+    ]
+
+    name: str
+    birth: str
+    phone: str = ' '
+
+    google_social_id: str = ' '
+    apple_social_id: str = ' '
+    kakao_social_id: str = ' '
+
+    @classmethod
+    def get_user_by_google_id(cls, sub: str):
+        items, _ = cls.query(pk_field='google_social_id', pk_value=sub, limit=1)
+        return items[0] if items else None
+
+    @classmethod
+    def get_user_by_apple_id(cls, sub: str):
+        items, _ = cls.query(pk_field='apple_social_id', pk_value=sub, limit=1)
+        return items[0] if items else None
+```
+
+Each `{provider}_social_id` is a sparse GSI keyed on the provider's stable `sub` claim. Default `' '` makes the index sparse — users without that provider don't appear under "lookup by social id" queries.
+
+<Callout type="warn">
+Match users by `social_id`, never by `email`. Users can change email at the provider, share email between accounts, or use Apple's private relay. Only `sub` is stable.
+</Callout>
+
+## 3. Login controller
+
+```python title="main/controller/google_auth.py"
+from sawsi.handler.controller_decorator import controller
+from main.service.social_auth import google_auth as svc
+from main.service.auth_service import _create_user_session_secure
+from main.model.user import User
+
+@controller
+def google_login(id_token: str, source_ip: str, device_info: dict | None = None,
+                 c_ts: float | None = None, req_ts: float = 0, **kwargs):
+    info = svc.verify_google_id_token(id_token)
+    if not info:
+        return {'status': 'invalid_token'}
+
+    user = User.get_user_by_google_id(info.sub)
+    if user:
+        sid, sess = _create_user_session_secure(user.id, source_ip, device_info, c_ts, req_ts)
+        return {
+            'status': 'succeed',
+            'registered': True,
+            'session_id': sid,
+            'o_s': sess.otp_secret,
+            'user_id': user.id,
+        }
+
+    return {
+        'status': 'need_register',
+        'registered': False,
+        'google_social_id': info.sub,
+        'email': info.email,
+        'name': info.name,
+    }
+```
+
+## 4. Register controller
+
+```python
+@controller
+def google_register(id_token: str, name: str, birth: str,
+                    source_ip: str, device_info: dict | None = None,
+                    c_ts: float | None = None, req_ts: float = 0, **kwargs):
+    info = svc.verify_google_id_token(id_token)        # re-verify!
+    if not info:
+        return {'status': 'invalid_token'}
+
+    if User.get_user_by_google_id(info.sub):
+        return {'status': 'already_registered'}
+
+    user = User(
+        name=name,
+        birth=birth,
+        google_social_id=info.sub,
+        email=info.email,
+    )
+    user.put()
+
+    sid, sess = _create_user_session_secure(user.id, source_ip, device_info, c_ts, req_ts)
+    return {
+        'status': 'succeed',
+        'session_id': sid,
+        'o_s': sess.otp_secret,
+        'user_id': user.id,
+    }
+```
+
+Two non-obvious points:
+
+- **Re-verify the id_token inside `register`.** Otherwise an attacker who captured a stale `need_register` response could fabricate a registration with a different name/birth.
+- **Check `get_user_by_google_id` immediately before `put()`.** There is a small race window where two concurrent register calls can both pass the check; consider wrapping in `with api.locking.lock(f'register_{info.sub}'): ...` for high-traffic providers.
+
+## 5. Provider-add checklist
+
+```
+[ ] service/social_auth/{provider}_auth.py — verify_*_id_token()
+[ ] AWS Secrets Manager: client_id / signing key in {env}/{project} (dev + prod)
+[ ] User model: {provider}_social_id field with default ' '
+[ ] User model: _indexes += [('{provider}_social_id', None)]
+[ ] User model: get_user_by_{provider}_id classmethod
+[ ] controller/{provider}_auth.py: {provider}_login and {provider}_register
+[ ] aws_handler.py: cmds added to NO_SESSION_CMDS
+[ ] IAM policy: Secrets Manager path covered in dev AND prod
+[ ] build_keeper.py: deploy to refresh the User GSI
+```
+
+## Next
+
+- [Admin sub-system](/docs/auth/admin) — different from user auth in structure and permissioning.
+- [Security posture](/docs/deployment/security) — the broader picture this fits into.

@@ -1,0 +1,160 @@
+---
+title: 필터링 원칙
+description: DynamoDB FilterExpression이 왜 금지인지, Python에서 안전하게 필터링하는 법을 알려 드려요.
+---
+
+`DynamoModel.query()`와 `.generate()`는 `sawsi.shared.filter_exp_util.Exp` DSL로 뒷받침되는 `filter_expression=` 인자를 노출해요. **쓰지 마세요.** 이 페이지에서 그 이유와, 대신 sawsi가 강제하는 컨벤션을 설명해 드릴게요.
+
+## `FilterExpression`이 실제로 하는 일
+
+DynamoDB의 `FilterExpression`은 쿼리 엔진이 아이템을 읽은 **후**, 클라이언트에 반환되기 **전**에 실행돼요. 결과는 세 가지예요.
+
+### 1. 필터링되어 버려진 아이템에도 RCU가 청구돼요
+
+쿼리 파티션에 10,000 아이템이 있고 `FilterExpression`이 50개만 남기더라도, DynamoDB는 여전히 10,000개 모두를 읽고 청구해요. 필터는 렌더링 사이드이지 쿼리 사이드가 아니에요.
+
+### 2. `limit`이 의미를 잃어요
+
+`limit=20`은 "인덱스에서 20개 읽고, 그 후 필터 적용"을 뜻해요. 보통 매칭되는 아이템이 **20개 미만**이 돌아와요. 둘 중 하나예요.
+
+- 점점 큰 `start_key`로 루프 돌려 페이지를 채우거나,
+- 페이지네이션이 망가졌음을 받아들이거나.
+
+둘 다 버그 공장이에요.
+
+### 3. 인덱스 설계가 숨어요
+
+`FilterExpression`이 쿼리가 *동작하는 것처럼* 보이게 만들어서, 팀이 결국 효율적인 작업을 가능케 할 GSI를 만들지 않게 돼요. 6개월 뒤에는 200GB 테이블과 그걸 전부 읽는 쿼리를 얻게 돼요.
+
+## 컨벤션
+
+```python
+# 1. 인덱스로 좁히기 — partition + sort key + sk_condition
+items, end_key = User.query(
+    pk_field='u_b', pk_value='_',
+    sk_condition='gte', sk_value=cutoff_ts,
+    limit=200,
+)
+
+# 2. 속성 접근으로 Python에서 필터
+active = [u for u in items if u.status == 'active' and u.country == 'KR']
+```
+
+세 가지 규칙이에요.
+
+1. **카디널리티 감소는 인덱스로 해요.** 파티션 + 정렬 키로 후보 집합을 수천 행까지 줄이는 GSI를 선택하거나 새로 만드세요.
+2. **나머지는 Python에서 필터해요.** 후보들은 이미 Pydantic 인스턴스라, 속성 접근이 타입 안전하고 무료예요.
+3. **후보 집합이 여전히 거대하면 인덱스가 틀린 거예요.** 멈추고 재설계하세요 — `FilterExpression`으로 덮지 마세요.
+
+## 구체적인 예
+
+### 사용자의 미읽 알림 찾기
+
+나쁜 예예요.
+
+```python
+notifs, _ = Notification.query(
+    pk_field='user_id', pk_value=user.id,
+    filter_expression=Exp('read', 'eq', False),
+)
+```
+
+좋은 예예요 — 인덱스를 추가해요.
+
+```python
+class Notification(DynamoModel):
+    _indexes = [
+        ('user_id', 'crt'),
+        ('user_id_unread', 'crt'),     # 조인 필드, 아래 참조
+    ]
+    user_id: str
+    user_id_unread: str = ' '
+    read: bool = False
+
+    def mark_read(self):
+        self.read = True
+        self.user_id_unread = ' '       # sparse 인덱스에서 제거해요
+        self.update()
+
+    @classmethod
+    def new(cls, user_id):
+        return cls(user_id=user_id, user_id_unread=user_id)   # 조인 필드
+```
+
+미읽 쿼리는 이렇게 해요.
+
+```python
+notifs, _ = Notification.query(pk_field='user_id_unread', pk_value=user.id)
+```
+
+실제 미읽 알림에 대해서만 비용이 청구돼요.
+
+### 이름 prefix 검색
+
+나쁜 예. 전체 테이블에 `FilterExpression('name', 'stw', query_text)`를 쓰는 거예요.
+
+좋은 예. sawsi가 정확히 이 용도로 내놓은 [SearchEngine n-gram 인덱스](/docs/services/ai-vector-search)를 쓰세요.
+
+### "선택 필터가 있는 목록" 컨트롤러
+
+```python
+@controller
+def list_events(
+    region: str | None = None,
+    sport_id: str | None = None,
+    start_key: dict | None = None,
+    **kwargs,
+):
+    # 가장 선택적인 사용 가능한 인덱스를 골라요
+    if sport_id:
+        items, end_key = Event.query(
+            pk_field='sport_id', pk_value=sport_id, sk_field='start_ts',
+            start_key=start_key, limit=20,
+        )
+    elif region:
+        items, end_key = Event.query(
+            pk_field='region1', pk_value=region, sk_field='crt',
+            start_key=start_key, limit=20,
+        )
+    else:
+        items, end_key = Event.query(limit=20, start_key=start_key)
+
+    # 둘 다 들어왔으면 빠져나간 다른 파라미터를 Python에서 후처리 필터해요
+    if sport_id and region:
+        items = [e for e in items if e.region1 == region]
+
+    return {'items': [e.model_dump() for e in items], 'cursor': end_key}
+```
+
+컨트롤러가 어떤 인덱스를 쓸지 고르는 구조예요 — 두 필터가 모두 주어지면 선택성이 더 높은 쪽이 쿼리를 주도하고, 다른 쪽은 Python에서 검사해요.
+
+## 정말 Exp가 필요할 때
+
+`Exp` DSL은 일부 엣지 케이스(어드민 도구, 임시 분석)가 서버 사이드 필터링을 필요로 해서 존재해요. **거기서는 써도 괜찮아요** — 단, 의식하면서 쓰세요.
+
+- 읽기 비용을 감수할 수 있는 일회성 스크립트.
+- 수천 행을 페이지로 넘기면서 몇 개만 표시하는 어드민 뷰 — 사용자가 기다릴 시간이 있는 경우요.
+
+사용자 대면이라면 답은 "안 돼요". 그리고 코드에 `FilterExpression` 사용처가 두세 곳 넘으면 설계 경보로 받아들이세요 — 스키마가 더 많은 인덱스를 필요로 하는 거예요.
+
+## Python 필터링과 페이지네이션은요?
+
+필터된 결과 `limit`개를 얻으려면 인덱스에서 `limit`보다 많이 읽어야 할 수도 있어요.
+
+```python
+def list_active_users(limit=20, start_key=None):
+    out = []
+    while len(out) < limit:
+        items, end_key = User.query(limit=200, start_key=start_key)
+        out.extend(u for u in items if u.status == 'active')
+        if end_key is None:
+            break
+        start_key = end_key
+    return out[:limit], end_key
+```
+
+이것도 받아들일 만하지만 상한이 있어요 — 활성 20을 얻으려고 10,000행을 읽고 있다면 스키마가 틀린 거예요.
+
+## 린터 커버리지
+
+agent-skills harness의 `sawsi_lint.py`는 `FilterExpression` 사용을 직접 잡지 않아요 — import 표면이 너무 일반적이라서요. 코드 리뷰에서 수동으로 검토해 주세요.

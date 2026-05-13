@@ -1,0 +1,55 @@
+{
+  "home": {
+    "badge": "프로덕션 프레임워크",
+    "title": "컨벤션이 내장된 AWS 람다 백엔드.",
+    "subtitle": "sawsi는 AWS 서버리스 백엔드용 Python 프레임워크입니다 — `cmd` 기반 라우팅, DynamoDB ORM, 지연 로딩 서비스 래퍼, 그리고 람다 한 개에서 함대 단위까지 확장되는 배포 스토리.",
+    "ctaPrimary": "문서 읽기",
+    "ctaSecondary": "GitHub에서 보기",
+    "featuresTitle": "무엇이 들어있나",
+    "features": {
+      "handlers": {
+        "title": "핸들러와 라우팅",
+        "desc": "@aws_handler_wrapper가 응답을 자동 포맷하고, router()가 시그니처 기반 주입으로 @controller 함수에 디스패치합니다."
+      },
+      "dynamo": {
+        "title": "DynamoModel ORM",
+        "desc": "Pydantic 타입 모델 + 자동 필드(id, crt, u_b), GSI 선언, sparse 인덱스 지원, 속성 단위 업데이트 추적."
+      },
+      "services": {
+        "title": "AWS 서비스 래퍼",
+        "desc": "S3, SQS, SES, SMS, Locking, Firehose, SecretsManager, Bedrock, OpenSearch, Vector KB — 모두 균일한 api.py 싱글턴 뒤에서."
+      },
+      "triggers": {
+        "title": "다중 트리거 람다",
+        "desc": "awsi add -t {agw|sqs|ebs|ws|webhook}로 API Gateway, SQS, EventBridge, WebSocket, 웹훅 수신기를 스캐폴딩합니다."
+      },
+      "deploy": {
+        "title": "컨테이너 이미지 배포",
+        "desc": "Dockerfile + buildspec-{env}.yml이 CodeBuild → ECR → Lambda 업데이트를 주도; build_keeper.py가 DynamoDB 테이블/인덱스를 멱등 초기화합니다."
+      },
+      "conventions": {
+        "title": "설정보다 컨벤션",
+        "desc": "{env}-{project} 리소스 네이밍, allowed_cmd_prefixes 보안 게이트, A/B/U 응답 코드 — 따분한 결정은 프레임워크가 합니다."
+      }
+    },
+    "exploreTitle": "어디서 시작하나",
+    "explore": {
+      "newcomer": {
+        "title": "sawsi 처음이라면",
+        "desc": "5분 투어로 시작해서 멘탈 모델을 따라가세요."
+      },
+      "building": {
+        "title": "기능을 만들고 있다면",
+        "desc": "OAuth, SQS 워커, 스케줄러 등 쿡북 레시피들."
+      },
+      "deploying": {
+        "title": "AWS에 배포한다면",
+        "desc": "컨테이너 이미지 배포, IAM env 스코핑, 콜드스타트 튜닝."
+      }
+    }
+  },
+  "nav": {
+    "docs": "문서",
+    "reference": "레퍼런스"
+  }
+}

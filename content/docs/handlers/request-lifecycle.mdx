@@ -1,0 +1,220 @@
+---
+title: Request lifecycle
+description: How a request travels from Lambda's event dict to a controller function and back.
+---
+
+This page is a complete walkthrough of one API Gateway request: the order of operations, what each layer does, and where the configuration knobs live.
+
+## The whole picture
+
+```
+event ─▶ @aws_handler_wrapper ─▶ handler(event, context) ─▶ router(cmd, body, headers, prefixes) ─▶ @controller fn ─▶ return value
+                                          │                                    │
+                                          ▼                                    ▼
+                                 standard body injection                signature-based injection
+                                 (user, source_ip, req_ts)              (body keys → kwargs)
+```
+
+## Layer 1 — `@aws_handler_wrapper`
+
+Defined in `sawsi.shared.handler_util`. Wraps your `handler(event, context)` function and turns its return value (or any raised exception) into a properly-shaped API Gateway response.
+
+```python
+@handler_util.aws_handler_wrapper(
+    error_receiver=slack_notify,
+    content_type='application/json',
+    use_traceback=False,
+    ignore_app_errors=[errs.no_session],
+)
+def handler(event, context):
+    ...
+```
+
+What it does, in order:
+
+1. Records `start = time.time()`.
+2. Calls your handler. Three branches follow.
+3. **Success branch** — your handler returned a value:
+   - If `None`, treats it as `{}`.
+   - Injects `rslt_cd = 'A00000'`, `rslt_msg = '요청 성공'`, `duration = time.time() - start`.
+   - Wraps the dict in `AWSResponse(body, content_type, status_code=200)` which JSON-serializes the body and adds CORS headers.
+4. **AppError branch** — your handler raised `error_util.AppError`:
+   - Builds `{'rslt_cd': str(ex.code), 'rslt_msg': str(ex.message), 'duration': ...}`.
+   - If `ex` is **not** in `ignore_app_errors`, calls `error_receiver(message)` with a stringified traceback for alerting.
+5. **Unknown-exception branch** — any other exception:
+   - Builds `{'rslt_cd': 'U99999', 'rslt_msg': str(ex), 'duration': ...}`.
+   - If `use_traceback=True`, includes the traceback in the response (use in dev, never in prod).
+   - Calls `error_receiver`.
+
+The `AWSResponse` class is a `dict` subclass shaped like:
+
+```python
+{
+    'statusCode': 200,
+    'headers': {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': '*',
+        'Access-Control-Allow-Headers': '*',
+    },
+    'body': '{"rslt_cd":"A00000",...}',
+    'isBase64Encoded': False,
+}
+```
+
+<Callout type="warn">
+Never return a dict that already has `statusCode`/`headers` from your handler. The wrapper will wrap it again and you'll get a malformed response. Either return a plain value or — if you really need raw control — bypass the wrapper.
+</Callout>
+
+## Layer 2 — request normalization
+
+Your handler typically extracts three values out of `event` using helpers from `sawsi.shared.handler_util`:
+
+```python
+body    = handler_util.get_body(event, context)       # parses JSON body, returns dict
+headers = handler_util.get_headers(event, context)    # lowercased headers dict
+source_ip = handler_util.get_source_ip(event, context)
+```
+
+It then **enriches** the body with values controllers may need:
+
+```python
+body['user'] = None              # set later if session_id resolves
+body['source_ip'] = source_ip
+body['req_ts'] = int(event['requestContext']['requestTimeEpoch']) / 1000
+```
+
+These three keys are conventional. A controller signature that names `user`, `source_ip`, or `req_ts` will receive them automatically thanks to Layer 4's signature injection.
+
+## Layer 3 — `router()`
+
+Signature:
+
+```python
+router(cmd: str, body: dict, headers: dict, allowed_cmd_prefixes: list) -> Any
+```
+
+Two responsibilities:
+
+### 3a. Security gate
+
+Before doing anything else, the router checks that `cmd` starts with one of the allowed prefixes:
+
+```python
+if not any(cmd.startswith(prefix) for prefix in allowed_cmd_prefixes):
+    raise error_util.Command_Prefix_not_allowed
+```
+
+It also does a second check against the **module** portion of `cmd` (everything before the last `.`) to prevent crafted `cmd` strings from reaching controllers through unintended prefixes.
+
+<Callout type="warn">
+Never pass `allowed_cmd_prefixes=[]` or `['*']`. The list is the entire perimeter of your routing security. The user-facing Lambda should allow only `<app>.controller` prefixes; the admin Lambda should allow only `admin.controller`.
+</Callout>
+
+### 3b. Dispatch by Python import path
+
+The router looks up `cmd` in `controller_registry`, which `@controller` populates. If found, it calls the function with **signature-based argument injection** (Layer 4).
+
+If the module hasn't been imported yet — for example, you've never called this controller in this Lambda container — the router imports it lazily, which triggers the `@controller` decorator and registers the function.
+
+## Layer 4 — `@controller` and signature injection
+
+The decorator itself is tiny:
+
+```python title="sawsi/handler/controller_decorator.py"
+controller_registry = {}
+
+def controller(func):
+    controller_registry[f'{func.__module__}.{func.__name__}'] = func
+    return func
+```
+
+The interesting part is in `router()`:
+
+```python
+signature = inspect.signature(func)
+filtered_body = {k: v for k, v in body.items() if k in signature.parameters}
+return func(**filtered_body)
+```
+
+The router takes the function's parameter names and pulls those keys from `body`. Unrelated keys are silently dropped.
+
+### What this means for controller authors
+
+```python
+@controller
+def update_profile(user, name: str, birth: str | None = None, **kwargs):
+    if user is None:
+        raise errs.no_session
+    user.name = name
+    if birth:
+        user.birth = birth
+    user.update()
+    return {'name': user.name}
+```
+
+- `user` comes from `body['user']` (set by the handler in Layer 2).
+- `name` and `birth` come from request fields.
+- `**kwargs` absorbs any extra keys (`source_ip`, `req_ts`, etc.) the handler injected. **Always include `**kwargs`** so future handler additions don't break callers.
+
+### What this means for security
+
+Because the router never passes `body` itself — only fields the function asks for — controllers can't accidentally read fields they shouldn't. This is a small but real defense against parameter-pollution bugs.
+
+## Layer 5 — return value
+
+Anything JSON-serializable. The wrapper merges your dict into the response envelope:
+
+```python
+return {'message': 'ok', 'data': {...}}
+# becomes
+# {'rslt_cd': 'A00000', 'rslt_msg': '요청 성공', 'duration': 0.012,
+#  'message': 'ok', 'data': {...}}
+```
+
+To signal failure, raise an `AppError`:
+
+```python
+from sawsi.shared.error_util import AppError
+raise AppError('B10042', 'invalid_phone_number')
+```
+
+The full code system (`A` for success, `B` for business errors, `U` for unknown) is documented in [Errors & result codes](/docs/architecture/errors).
+
+## Cold start signal
+
+A common pattern is to detect cold starts for observability:
+
+```python title="main/aws_handler.py"
+import time
+COLD_START_AT = time.time()
+COLD = True
+
+@handler_util.aws_handler_wrapper(...)
+def handler(event, context):
+    global COLD
+    cold_start = COLD
+    COLD = False
+    body = handler_util.get_body(event, context)
+    body['cold_start'] = cold_start
+    ...
+```
+
+This costs nothing and shows up in your structured logs.
+
+## What is **not** here
+
+- No middleware system. If you want pre/post hooks, put them in the handler body before/after `router(...)`. The framework deliberately keeps the path straight.
+- No dependency injection container. State sharing is done by importing `api.py`.
+- No `before_request`/`after_request` decorators. The wrapper is one level higher than the controller; there is no per-controller hook.
+
+## Next
+
+<Cards>
+  <Card title="Triggers" href="/docs/handlers/triggers">
+    The same lifecycle, but for SQS, EventBridge, WebSocket, and webhook receivers.
+  </Card>
+  <Card title="Errors & result codes" href="/docs/architecture/errors">
+    The A/B/U code system, AppError, and the `error_receiver` integration.
+  </Card>
+</Cards>

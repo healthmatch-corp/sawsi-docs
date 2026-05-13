@@ -1,0 +1,214 @@
+---
+title: 테스트 & 로컬 개발
+description: Flask 어댑터, AWS mocking, 그리고 build_keeper.py를 테스트에서 멱등하게 유지하는 법을 알려드려요.
+---
+
+sawsi는 테스트 프레임워크를 따로 출시하지 않아요. 프레임워크가 평범한 Python 함수(컨트롤러, 서비스)와 단순한 `event → dict` 요청 모양을 선택했다는 건 표준 도구 — pytest, moto, Flask 어댑터 — 만으로 충분하다는 뜻이에요.
+
+## Flask 어댑터로 로컬 개발
+
+람다 런타임 모델 — `event` dict 입력, 응답 dict 출력 — 은 어떤 웹 서버에서도 쉽게 페이크할 수 있어요. 최소 Flask 어댑터예요.
+
+```python title="local_server_main.py"
+from flask import Flask, request, jsonify
+import json, time, os
+
+os.environ.setdefault('env', 'dev')
+os.environ.setdefault('AWS_DEFAULT_REGION', 'ap-northeast-2')
+
+from main.aws_handler import handler
+
+app = Flask(__name__)
+
+@app.route('/', methods=['OPTIONS'])
+def cors():
+    r = jsonify({})
+    r.headers['Access-Control-Allow-Origin']  = '*'
+    r.headers['Access-Control-Allow-Methods'] = 'POST,OPTIONS'
+    r.headers['Access-Control-Allow-Headers'] = '*'
+    return r
+
+@app.route('/', methods=['POST'])
+def root():
+    body = request.get_json()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    # API Gateway event 모양 미러링
+    event = {
+        'body': json.dumps(body),
+        'headers': headers,
+        'requestContext': {
+            'requestId': 'local-dev',
+            'requestTimeEpoch': int(time.time() * 1000),
+            'identity': {'sourceIp': request.remote_addr},
+        },
+    }
+    response = handler(event, {})
+    inner = json.loads(response['body']) if 'body' in response else response
+    return jsonify(inner)
+
+if __name__ == '__main__':
+    app.run(port=8000, debug=True)
+```
+
+```bash
+env=dev python local_server_main.py
+```
+
+진짜 람다처럼 curl로 호출해 볼 수 있어요.
+
+```bash
+curl -X POST http://localhost:8000 \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd": "main.controller.system.health_check"}'
+```
+
+이 어댑터는 로컬 작업의 95%에 *충분히 좋아요* — 컨트롤러가 실행되고, DynamoDB 쿼리가 dev 테이블에 적중하고, S3 업로드가 dev 버킷에 안착해요.
+
+## `npm run local` 연결
+
+프로젝트 루트의 `package.json`이 루프를 편하게 만들어 줘요.
+
+```json title="package.json"
+{
+  "name": "myproject",
+  "private": true,
+  "scripts": {
+    "local":       "PYTHONPATH=. .venv/bin/python local_server_main.py",
+    "local:main":  "PYTHONPATH=. .venv/bin/python local_server_main.py",
+    "local:admin": "PYTHONPATH=. .venv/bin/python local_server_admin.py"
+  }
+}
+```
+
+## 컨트롤러 단위 테스트
+
+컨트롤러는 평범한 Python 함수예요. 직접 테스트할 수 있어요.
+
+```python title="tests/test_member.py"
+import pytest
+from main.controller import member
+import errs
+
+def test_register_with_existing_phone_returns_already_registered(monkeypatch):
+    monkeypatch.setattr(
+        'main.controller.member.User.generate',
+        lambda **kw: iter([type('U', (), {'phone': kw['pk_value']})()]),
+    )
+    monkeypatch.setattr(
+        'main.controller.member.verify_token',
+        lambda *a, **kw: True,
+    )
+
+    result = member.register(
+        auth_token='t',
+        source_ip='127.0.0.1',
+        phone='01012345678',
+        password='pw',
+        name='Kim',
+        birth='1990-01-01',
+    )
+    assert result['status'] == 'already_registered'
+```
+
+컨트롤러 시그니처의 Pydantic 타입이 Python 타입 체커를 첫 방어선으로 만들어 주고, 테스트가 그 위의 비즈니스 로직을 잡아 줘요.
+
+## 서비스 테스트
+
+서비스는 종종 `api.*`를 건드려요. 두 가지 접근이 있어요.
+
+### dev DynamoDB 적중
+
+가장 단순해요. 테스트가 dev 테이블에 row를 삽입하고 다시 읽어요. 단점은 테스트가 느려지고(네트워크), 병렬 테스트 실행이 서로 발을 디딜 수 있다는 거예요.
+
+### moto 사용
+
+`moto`가 boto3 호출을 가로채서 인-프로세스 페이크로 제공해요.
+
+```python title="tests/conftest.py"
+import pytest
+from moto import mock_aws
+
+@pytest.fixture(autouse=True)
+def aws_mock():
+    with mock_aws():
+        yield
+```
+
+```python title="tests/test_service.py"
+def test_event_score_recompute(aws_mock):
+    import api
+    api.dynamo.create_table('dev-myproject_event')   # moto 페이크 안에서
+    api.dynamo.put_item('dev-myproject_event', {'id': 'e1', 'crt': 0.0, 'u_b': '_'}, True)
+
+    from main.service.event_service import recompute_scores
+    recompute_scores()
+
+    item = api.dynamo.get_item('dev-myproject_event', 'e1')
+    assert item['score'] > 0
+```
+
+moto의 DynamoDB 충실도가 높아요(GSI 동작). S3와 SQS도 잘 지원해요. 더 이국적인 서비스(Firehose, Bedrock)는 래퍼를 직접 mock해야 해요.
+
+## `aws_handler.py` 엔드 투 엔드 테스트
+
+람다 모양 event를 구성하고 핸들러를 호출해요.
+
+```python
+def test_health_check():
+    from main.aws_handler import handler
+    response = handler({
+        'body': '{"cmd":"main.controller.system.health_check"}',
+        'headers': {},
+        'requestContext': {'requestTimeEpoch': 0},
+    }, {})
+    body = json.loads(response['body'])
+    assert body['rslt_cd'] == 'A00000'
+```
+
+## 테스트에서 `build_keeper.py`
+
+`build_keeper.py`가 AWS 리소스를 만드는 곳이에요. 테스트가 실수로 prod에 대해 실행되면 안 돼요. 두 가지 안전장치가 있어요.
+
+1. **`config.build = True`가 `build_keeper.run()` 안에서만** — 그리고 컨트롤러는 `config.build`에 분기하지 마세요. 플래그는 "배포 빌드 컨텍스트에 있다"는 신호일 뿐이에요.
+2. **테스트가 `env=test`로 실행** (또는 dev 계정에 대해 `env=dev`). CI가 실수로 prod를 가리켜도 `aws_iam_policy_test.json`이 prod 리소스에 쓰기 권한을 주지 않아요 — IAM이 구해 줘요.
+
+## 진짜 배포 후 스모크 테스트
+
+새 배포 후, API Gateway URL에 대해 원라이너를 실행해 보세요.
+
+```bash
+curl -sX POST https://<your-api>.execute-api.ap-northeast-2.amazonaws.com/default/dev_myproject_main_docker \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"main.controller.system.health_check"}' | jq .
+```
+
+`rslt_cd`가 `A00000`이면 배포가 살아 있는 거예요. Python import 에러로 `U99999`가 보이면 이미지에 문제가 있어요. `B00006`이 보이면 `allowed_cmd_prefixes`가 잘못 구성된 거예요.
+
+health-check 컨트롤러는 작성할 수 있는 가장 저렴한 것이면서 가장 가치 있는 것이에요.
+
+```python title="main/controller/system.py"
+@controller
+def health_check(**kwargs):
+    return {
+        'status': 'ok',
+        'env': config.env,
+        'ts': time.time(),
+    }
+```
+
+## CI ergonomics
+
+모든 푸시의 최소 CI예요.
+
+1. `pip install -r requirements.txt`
+2. `pytest`
+3. (옵션) `test` env 계정에 대해 `python build_keeper.py` 실행 — 스크립트가 크래시하지 않는지 검증해요.
+
+`pytest`가 통과하면 `main`으로의 머지에서 CodeBuild가 발동해 dev로 출시돼요.
+
+## 이것이 *아닌* 것
+
+- 엔드 투 엔드 브라우저 테스트 이야기가 아니에요. 그건 클라이언트 쪽 관심사예요.
+- 부하 테스트 이야기가 아니에요. dev API Gateway에 대해 `wrk`나 `k6`를 별도로 사용하세요.
+- 카오스 엔지니어링 이야기가 아니에요. AWS가 그걸 네이티브로 줘요 (랜덤 람다 재활용).

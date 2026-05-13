@@ -1,0 +1,191 @@
+---
+title: AI, Vector & Search
+description: Bedrock for LLMs, S3Vector + VectorKB for embeddings, SearchEngine for Korean n-gram autocomplete.
+---
+
+sawsi ships five wrappers around AI-adjacent services. They are independent but compose well — VectorKB uses Bedrock for embeddings and S3 Vector for storage, SearchEngine uses DynamoDB for indexing.
+
+## Bedrock — LLM calls
+
+`BedrockAPI` wraps both the **Converse API** (high-level, tool-calling-friendly) and the older **InvokeModel API** (raw).
+
+```python
+resp = api.bedrock.converse(
+    model_id='anthropic.claude-haiku-4-5-20251001',
+    system='You translate text to Korean.',
+    messages=[
+        {'role': 'user', 'content': [{'text': 'Hello world'}]},
+    ],
+    max_tokens=512,
+    temperature=0.0,
+)
+print(resp['output']['message']['content'][0]['text'])
+```
+
+For tool use:
+
+```python
+resp = api.bedrock.converse(
+    model_id='anthropic.claude-haiku-4-5-20251001',
+    messages=messages,
+    tool_config={
+        'tools': [{'toolSpec': {
+            'name': 'get_weather',
+            'inputSchema': {'json': {'type': 'object', 'properties': {'city': {'type': 'string'}}}},
+        }}],
+    },
+)
+```
+
+The wrapper does **not** persist conversations. Persisting chat history (in DynamoDB or otherwise) is your application's job — the wrapper is a single call.
+
+### Picking models
+
+- `claude-haiku-4-5-...` — fast, cheap, good for routine extraction.
+- `claude-sonnet-4-6-...` — balanced.
+- `claude-opus-4-7-...` — most capable; use sparingly.
+
+Pin model ids in `config.py` or load from `secret_manager` so dev/prod can A/B different models.
+
+### Cost & rate limits
+
+Bedrock pricing is per token. Set a max-tokens cap on every call. Use `temperature=0.0` for deterministic tasks (extraction, translation) so you can cache results.
+
+## S3 Vector — vector store on S3
+
+`S3VectorAPI` is a vector store implemented over S3 (one index = one bucket prefix). Cheap, slow-ish, fine up to millions of vectors.
+
+You generally **don't** use it directly; the layer above (`VectorKBAPI`) wires it to Bedrock embeddings.
+
+## Vector KB — embeddings + storage
+
+`VectorKBAPI` is the recommended entry point for retrieval-augmented generation:
+
+```python title="api.py"
+vector_kb = LazyLoadedAPI(
+    VectorKBAPI,
+    vector_bucket_name=f'{env}-{project_name}-vector',
+    index_name='product_descriptions',
+    embed_model_id='amazon.titan-embed-text-v2:0',
+    dimension=1024,
+    distance_metric='cosine',
+    region=region,
+)
+```
+
+```python
+# build_keeper.py
+api.vector_kb.init()
+
+# in code
+api.vector_kb.add(key='prod-123', text='A waterproof red running shoe', metadata={'sku': 'RR-123'})
+
+results = api.vector_kb.search('shoes for rainy days', top_k=3)
+for r in results:
+    print(r['key'], r['score'], r['metadata'])
+```
+
+What `add()` actually does:
+
+1. Calls Bedrock to embed `text` into a 1024-d vector.
+2. Stores `(key, vector, text, metadata)` into S3 Vector under `index_name`.
+
+What `search()` actually does:
+
+1. Embeds the query text.
+2. Finds the top-k nearest vectors by cosine similarity.
+3. Returns the stored metadata plus the original text.
+
+Default model is `amazon.titan-embed-text-v2:0` at 1024 dimensions. If you change either, you must re-index — vectors at different dimensions can't be compared.
+
+## OpenSearch — full-text search
+
+For full-text search beyond vectors (BM25, faceting, aggregations), use OpenSearch directly via `OpenSearchAPI`. The framework signs your requests with SigV4 but otherwise gets out of your way.
+
+```python
+api.opensearch.put_document('products', product.id, {
+    'name': product.name,
+    'description': product.description,
+    'category': product.category,
+})
+
+response = api.opensearch.run(
+    'POST', '/products/_search',
+    body={
+        'query': {'multi_match': {
+            'query': 'rainy running shoes',
+            'fields': ['name^2', 'description'],
+        }},
+        'aggs': {'by_category': {'terms': {'field': 'category.keyword'}}},
+    },
+)
+```
+
+You bring your own index mapping and your own re-indexing strategy. The wrapper is intentionally low-level.
+
+## SearchEngine — Korean n-gram autocomplete
+
+For autocomplete and prefix search (especially over Korean text), DynamoDB alone is enough. `sawsi.service.searchengine.SearchEngine` builds a 2-gram inverted index inside a DynamoDB table:
+
+```python
+from sawsi.service.searchengine import SearchEngine
+
+product_search = SearchEngine(api.dynamo, 'product_search')
+
+# build_keeper.py
+product_search.init_table()
+
+# on every product create/update
+product_search.put_data(item_id=product.id, text=product.name)
+
+# on autocomplete
+results = product_search.search(query='러닝')
+```
+
+Internally each text is decomposed into 2-grams with start/end markers:
+
+```
+'러닝화' → ['^러', '러닝', '닝화', '화$']
+```
+
+Each n-gram becomes a row keyed `(n_gram, item_id)`. A search for `'러닝'` looks up the partition `'러닝'` and returns all item_ids that share that n-gram, ranked by total matches.
+
+Properties:
+
+- Pure DynamoDB — no OpenSearch dependency, no cold-start to a search cluster.
+- Works for Korean, Japanese, Chinese, and Latin alphabets.
+- Linear-ish scaling — fine up to a few hundred thousand items per index.
+- No relevance tuning (BM25, synonyms, stemming) — for that, OpenSearch.
+
+## Putting it all together
+
+A typical AI feature stack:
+
+```
+User query
+   │
+   ▼
+SearchEngine (autocomplete, immediate filtering)
+   │ (no hit / wants semantic)
+   ▼
+VectorKB.search()  — top 5 candidates from RAG corpus
+   │
+   ▼
+Bedrock.converse(messages=[..., context_from_candidates])
+   │
+   ▼
+Response
+```
+
+Each piece is a thin wrapper. The orchestration is plain Python in a service module.
+
+## Costs and budgets
+
+| Service | Cost driver |
+|---|---|
+| Bedrock | tokens (input + output) |
+| S3 Vector / VectorKB | S3 GET/PUT + storage; cheap |
+| OpenSearch | hourly instance billing — sized cluster |
+| SearchEngine | DynamoDB RCU/WCU — only n-gram lookups |
+
+For low-traffic apps, Bedrock + SearchEngine + VectorKB has effectively zero idle cost. OpenSearch has a floor (smallest cluster) and only makes sense once you outgrow SearchEngine.

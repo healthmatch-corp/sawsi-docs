@@ -1,0 +1,183 @@
+---
+title: API documentation generation
+description: DocMaker — the test-as-documentation pattern that produces OpenAPI from your live endpoints.
+---
+
+sawsi ships `sawsi.api_doc.DocMaker`, a tiny tool that **records actual API calls into structured docs**. The same script that exercises every endpoint produces a JSON file you can serve as Swagger/OpenAPI, with real example responses.
+
+## The idea
+
+Most API doc tools ask you to write a separate spec file. sawsi flips this: you write a script that calls each endpoint, and the recording becomes the doc. If the script runs green, the docs are by definition accurate; if a request shape changes, the doc-generating script is what catches it.
+
+## A minimal `doc_maker.py`
+
+```python title="main/doc_maker.py"
+from sawsi.api_doc.doc_generator import DocMaker
+from main.aws_handler import handler
+
+doc = DocMaker(
+    entry_function=handler,
+    base_url='https://<your-api-gw>.execute-api.ap-northeast-2.amazonaws.com/default/dev_myproject_main_docker',
+    test_function=None,
+)
+
+# Optional: shared headers
+doc.add_header('session_id', 'string', '', 'User session token', required=False)
+doc.add_header('Content-Type', 'string', 'application/json', '', required=True)
+
+def make_api_doc():
+    doc.start_test()
+
+    # Register a test user (so we have a session for subsequent calls)
+    res = doc.req(
+        api_name='register',
+        api_description='Register a new user',
+        body={
+            'cmd': 'main.controller.member.register',
+            'phone': '01099990000',
+            'auth_token': 'TEST',
+            'password': 'pw',
+            'name': 'Doc Tester',
+            'birth': '1990-01-01',
+        },
+        headers={},
+        api_tags=['auth'],
+    )
+    session_id = res['session_id']
+
+    # Fetch their profile
+    doc.req(
+        api_name='get_profile',
+        api_description='Get the authenticated user profile',
+        body={'cmd': 'main.controller.user.get_profile'},
+        headers={'session_id': session_id},
+        api_tags=['user'],
+    )
+
+    # ... call every other endpoint you want documented
+
+    # Write the OpenAPI JSON
+    with open('main_api.json', 'w') as f:
+        json.dump([asdict(a) for a in doc.api_list], f, indent=2, ensure_ascii=False)
+```
+
+Each `doc.req(...)` call:
+
+1. Builds an event dict matching what API Gateway would send.
+2. Calls `handler(event, {})` — the **real** Lambda code path.
+3. Records `(api_name, body, headers, response)` into `doc.api_list`.
+
+After the script runs, `main_api.json` is a JSON array describing every endpoint with example payloads and responses.
+
+## Running it
+
+Wire `make_api_doc()` into `build_keeper.py`:
+
+```python title="build_keeper.py"
+def run():
+    config.build = True
+    sync_all_models(['main.model'])
+    api.locking.init_table()
+    api.firehose_log.init()
+    api.s3_public.init_s3_bucket(acl='public-read')
+
+    if config.env == 'dev':
+        import main.doc_maker
+        main.doc_maker.make_api_doc()
+```
+
+The `if config.env == 'dev'` guard prevents production builds from generating docs (and dummy users) against prod data.
+
+## Serving the docs
+
+Once `main_api.json` is generated, you have a few options:
+
+1. **Upload to S3 and serve a Swagger UI** from a static bucket.
+2. **Render with Redoc or Stoplight Elements** in your admin portal.
+3. **Commit it** to a `docs/` folder for offline reading.
+
+The S3 approach is the cleanest:
+
+```python title="build_keeper.py (continued)"
+if config.env == 'dev':
+    main.doc_maker.make_api_doc()
+    # upload to public bucket so the QA team can browse it
+    api.s3_public.upload_file('main_api.json', 'api-docs/main_api.json', content_type='application/json')
+```
+
+## Per-Lambda doc_maker
+
+Each Lambda that you want documented gets its own `doc_maker.py`:
+
+| File | Documents |
+|---|---|
+| `main/doc_maker.py` | The user-facing API |
+| `admin/doc_maker.py` | The admin API |
+| `land/doc_maker.py` | The public/landing-page API |
+| `webhook_receiver/doc_maker.py` | Inbound webhook endpoints (rare) |
+| `websocket_receiver/doc_maker.py` | WebSocket message types (rare) |
+
+SQS/scheduler/s3trigger Lambdas don't usually get a doc — their "API surface" is internal.
+
+## Dummy data setup
+
+A good `doc_maker.py` is **idempotent** and operates on **dummy users** so it can run on every deploy without polluting real data. The convention:
+
+```python
+def _get_or_create_test_user():
+    user = User.get_user_by_phone('01099990000')
+    if user:
+        return user
+    user = User(name='Doc Tester', phone='01099990000', birth='1990-01-01')
+    user.put()
+    return user
+```
+
+The first deploy creates the test user; subsequent deploys reuse them.
+
+For destructive endpoints (delete account, etc.), use a separate test user that gets recreated each run.
+
+## Tagging and grouping
+
+`api_tags` groups endpoints in the rendered UI:
+
+```python
+doc.req(api_tags=['auth'], ...)
+doc.req(api_tags=['user', 'profile'], ...)
+doc.req(api_tags=['event', 'discovery'], ...)
+```
+
+Renderers typically display tags as sidebar sections.
+
+## Mock responses
+
+When you don't want to actually run an endpoint (e.g. third-party API in the loop), pass `run_func=False, mock_response={...}`:
+
+```python
+doc.req(
+    api_name='external_search',
+    body={'cmd': 'main.controller.search.external'},
+    run_func=False,
+    mock_response={'rslt_cd': 'A00000', 'results': [...]},
+)
+```
+
+The doc is recorded with the mock response. Use sparingly — every mock is a place the doc can drift from reality.
+
+## When this falls down
+
+`DocMaker` is great for stable APIs documented for human or internal-tool consumption. It's less ideal when:
+
+- You need **request/response schemas** to be consumed by a typed client generator. (OpenAPI 3.x schemas with `$ref`, etc.) The output is more a recording than a schema.
+- You need **versioning** of the API documentation across deploys. The output is a snapshot; pin it in source if you want history.
+- You need **authentication examples** to be self-contained. The pattern of "register → use session" works but is verbose for every endpoint.
+
+For those cases, layer Pydantic-based schema export on top, or move to a manual OpenAPI spec.
+
+## What it gives you, for free
+
+- An automated proof on every deploy that your endpoints work end-to-end.
+- A human-readable description of every endpoint and its current response shape.
+- An artifact your QA and front-end teams can rely on.
+
+That last one is the real win — keeping API docs accurate is mostly a problem of *making it harder to lie* than to tell the truth. This pattern makes the doc the same thing as the test.

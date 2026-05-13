@@ -1,0 +1,190 @@
+---
+title: 백그라운드 워커 & 스케줄링
+description: SQS 워커, EventBridge 스케줄, 분산 락 — "요청 경로가 아닌 곳"을 위한 세 가지 프리미티브를 다뤄요.
+---
+
+어떤 작업은 요청 모양이 아니에요 — 오래된 레코드 정리하기, 오전 9시 푸시 알림 보내기, 비디오 업로드 처리하기 같은 것들이요. sawsi가 그걸 위해 세 가지 프리미티브를 제공해요.
+
+## SQS 워커 — 비동기 팬아웃
+
+엔드 투 엔드 패턴을 보여 드릴게요:
+
+### 송신자
+
+```python title="main/service/event_service.py"
+def schedule_post_event_cleanup(event_id):
+    api.sqs.send_message(json.dumps({
+        'type': 'queue_receiver.controller.event_cleanup.run',
+        'body': {'event_id': event_id, 'after_ts': time.time() + 3600},
+    }))
+```
+
+컨벤션: JSON에 `type`(cmd가 돼요)과 `body`(컨트롤러 인자가 돼요)를 담아요.
+
+### 워커
+
+```python title="queue_receiver/aws_handler.py"
+from concurrent.futures import ThreadPoolExecutor
+import json
+
+@handler_util.aws_handler_wrapper(use_traceback=True)
+def handler(event, context):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = []
+        for record in event['Records']:
+            msg = json.loads(record['body'])
+            futures.append(pool.submit(_one, msg['type'], msg.get('body', {})))
+        for f in futures:
+            f.result()        # SQS가 배치 전체를 재시도하도록 다시 raise해요
+    return None
+
+def _one(cmd, body):
+    return router(cmd, body, {}, allowed_cmd_prefixes=['queue_receiver.controller'])
+```
+
+```python title="queue_receiver/controller/event_cleanup.py"
+@controller
+def run(event_id: str, after_ts: float, **kwargs):
+    event = Event.get(event_id)
+    if not event or event.crt > after_ts:
+        return
+    event.is_archived = True
+    event.update()
+```
+
+### 실패 처리
+
+`_one`이 raise하면 future 호출이 예외를 표면화하고, SQS 배치가 실패로 표시되고, 메시지가 큐로 돌아가서 재시도돼요 (큐의 redrive 정책까지요). 반복 실패 메시지를 위해 큐 레벨에서 Dead-Letter Queue를 구성해 주세요.
+
+특정 종류의 실패에서 재시도를 피하려면 이렇게 해요:
+
+```python
+def _one(cmd, body):
+    try:
+        return router(cmd, body, {}, allowed_cmd_prefixes=['queue_receiver.controller'])
+    except errs.permanently_invalid:
+        log_and_swallow(cmd, body)
+        return None
+```
+
+### 워커 수 선택
+
+`max_workers=4`가 출발점이에요. 제약은 보통 다운스트림 레이트 리밋(DynamoDB 용량, 서드파티 API)이에요. 람다 자체의 동시성 한계는 독립적이고 SQS event source mapping의 `BatchSize`와 `MaximumConcurrency`로 제어해요.
+
+## EventBridge Scheduler — 주기 작업
+
+EventBridge가 분당 1회 깨우는 람다 함수 하나를 둬요. 핸들러가 `ScheduledTask`로 여러 cron 매칭 작업을 병렬 실행해요:
+
+```python title="scheduler/aws_handler.py"
+from sawsi.shared.schedule_util import ScheduledTask, join
+
+def handler(event, context):
+    # 매분
+    with ScheduledTask('* * * * *') as do:
+        from scheduler.controller import bots
+        do(bots.tick)
+
+    # 10분마다
+    with ScheduledTask('*/10 * * * *') as do:
+        from scheduler.controller import meal
+        do(meal.send_meal_reminders)
+
+    # 매시 :01
+    with ScheduledTask('1 * * * *') as do:
+        from scheduler.controller import match
+        do(match.send_pre_match_notifications)
+
+    # 매일 KST 09:00 (서버는 UTC)
+    with ScheduledTask('0 0 * * *') as do:
+        from scheduler.controller import daily
+        do(daily.run)
+
+    # 금요일 20:00
+    with ScheduledTask('0 11 * * 5') as do:
+        from scheduler.controller import weekly
+        do(weekly.summary)
+
+    join()
+    return None
+```
+
+### `ScheduledTask` 작동 방식
+
+`__enter__`에서 cron 식을 `datetime.utcnow()`에 대해 평가해요. 현재 분이 일치하면 `do(callable)`이 함수를 백그라운드 스레드에 예약해요. 일치하지 않으면 `do`는 no-op예요.
+
+`join()`이 이 호출에서 시작된 모든 백그라운드 스레드를 대기해요. 빠뜨리면 람다가 스레드가 끝나기 전에 종료되어 작업이 죽을 수 있어요.
+
+### 타임존
+
+Cron 식은 **UTC**(람다의 시계)에 대해 평가돼요. KST나 로컬 시간 작업을 위해선 오프셋을 직접 계산해 주세요. 예: 09:00 KST는 00:00 UTC → `'0 0 * * *'`예요.
+
+### 이중 실행 방지
+
+`'0 9 * * *'` 작업은 EventBridge가 분당 람다를 발사하면 9:00:00, 9:00:01, ... 9:00:59에 실행돼요. cron 체크가 분 해상도라서 cron 블록은 **매칭되는 분당 1회** 발사되지만, 그 분 안에 EventBridge가 이중 발사하면 람다 호출 자체가 여러 번 일어날 수 있어요.
+
+작업을 멱등하게 만들기 위해 `(날짜, 시간, 분)`으로 키잉해요:
+
+```python
+@controller
+def run(**kwargs):
+    key = datetime.utcnow().strftime('daily-%Y-%m-%d')
+    with api.locking.lock(key, max_alive_ts=300, max_retries=1):
+        # 실제 작업
+        ...
+```
+
+두 번째 호출이 락에 부딪히면 두 번째는 no-op이 돼요.
+
+## 분산 락 — `LockingAPI`
+
+람다 간 직렬화를 위한 DynamoDB 기반 락이에요. 락 테이블은 TTL이 있는 조건부 `put_item`을 사용해요.
+
+```python
+with api.locking.lock(
+    object_key='register_phone_+82-10-1234-5678',
+    max_alive_ts=30,         # 락 자동 만료 30초
+    max_retries=3,            # 획득 시도 최대 3회
+    wait_time=2,              # 재시도 사이 2초 sleep
+):
+    # 임계 구역
+    ...
+```
+
+언제 쓰면 좋을까요:
+
+- **경합 가능한 "확인 후 쓰기"** — 예: OAuth register의 기존 사용자 확인.
+- 이중 실행이 안 되는 스케줄러의 **기간당 1회 작업**.
+- 우회가 용납되지 않는 액션에 대한 **사용자별 레이트 제한**.
+
+언제 쓰지 말아야 할까요:
+
+- DynamoDB *아이템*은 옵티미스틱 동시성(`ConditionExpression`)을 선호해요 — 더 저렴하고, 별도 락 테이블 읽기도 없어요.
+- UI 버튼 이중 클릭 방지엔 — 너무 거칠고 너무 느려요.
+
+## 셋을 조합하기
+
+프로덕션에서 흔한 패턴이에요:
+
+1. **API 요청**이 백그라운드 처리가 필요한 액션을 받아요.
+2. **API 핸들러**가 즉각 피드백 부분(예: "pending" 표시)을 하고 SQS 메시지를 큐잉해요.
+3. **SQS 워커**가 메시지를 받아 사용자(또는 리소스)에 락을 걸고, 무거운 작업을 하고, 풀어 줘요.
+4. **스케줄러**가 "stuck pending" 행을 주기 스캔해 다시 큐잉해요.
+
+이렇게 하면 사용자에게 빠른 응답을, 워커 팬아웃에 스케일을, 락에 중복 처리 방지를, 스케줄러에 빠진 모든 것의 후속을 한 번에 챙길 수 있어요.
+
+## 비용 메모
+
+- SQS: 저렴해요. 백만 메시지당 ~$0.40 정도예요.
+- EventBridge: 이 속도엔 무료예요 (분당 1 규칙).
+- Locking: 락 획득마다 DynamoDB 쓰기가 두 번이에요 (try-put + delete). 매우 높은 churn엔 임계 구역을 배치해 주세요.
+
+## 다음 단계
+
+<Cards>
+  <Card title="다중 람다 구성" href="/docs/architecture/multi-lambda">
+    이 워커들이 사용자 API와 한 프로젝트에서 공존하는 법을 알려 드려요.
+  </Card>
+  <Card title="옵저버빌리티" href="/docs/architecture/observability">
+    큐, 스케줄, 락 churn을 관찰하는 법을 알려 드려요.
+  </Card>
+</Cards>

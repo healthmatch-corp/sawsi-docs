@@ -1,0 +1,68 @@
+---
+title: 환영해요
+description: AWS 람다 백엔드를 위한 Python 프레임워크, sawsi 공식 핸드북이에요.
+---
+
+**sawsi** (simple-aws-interface)는 따분한 부분을 다시 발명하지 않고 AWS 람다 백엔드를 출시하기 위한 Python 프레임워크예요. `cmd` 기반 라우터, Pydantic 기반 DynamoDB ORM, 지연 로딩 AWS 서비스 래퍼, 그리고 의견 있는 배포 흐름을 하나의 일관된 스택으로 묶었어요.
+
+이 핸드북은 첫 원칙부터 배포 당일 체크리스트까지 프레임워크를 다뤄요. 네 개의 큰 흐름으로 나뉘어 있어요:
+
+<Cards>
+  <Card title="기초" href="/docs/introduction/about">
+    sawsi가 무엇인지, 왜 존재하는지, 그리고 이후 모든 페이지에서 들고 다닐 멘탈 모델을 알려드려요.
+  </Card>
+  <Card title="빌딩 블록" href="/docs/handlers/request-lifecycle">
+    핸들러, 라우팅, DynamoModel, 인증, 그리고 `api.py` 뒤에 있는 AWS 서비스 래퍼들을 다뤄요.
+  </Card>
+  <Card title="아키텍처" href="/docs/architecture/multi-lambda">
+    다중 람다 구성, 에러 모델, 옵저버빌리티, 그리고 배포 파이프라인을 살펴봐요.
+  </Card>
+  <Card title="실전" href="/docs/practice/cookbook">
+    컨벤션, 안티패턴, 쿡북 레시피, 그리고 전체 API 레퍼런스를 모았어요.
+  </Card>
+</Cards>
+
+## 누구를 위한 것인가
+
+여러분이 AWS에서 Python으로 서버리스 백엔드를 만들고 있고, 다음을 원한다면 — 이 책이 맞는 매뉴얼이에요:
+
+- REST 경로 매칭 대신 평평한 **`cmd` → 컨트롤러** API 표면.
+- GSI와 sparse 인덱스를 1급으로 다루는 DynamoDB ORM.
+- 단일 AWS 리소스 풀(`api.py`)을 API Gateway, SQS, EventBridge, S3, WebSocket, 웹훅 수신기 등 여러 람다 트리거가 중복 없이 공유하는 방식.
+- 매 릴리스마다 테이블/버킷/인덱스를 멱등 초기화하는 컨테이너 이미지 배포.
+
+이 모양이 여러분의 프로젝트라면, 이게 그 매뉴얼이에요.
+
+## 30초 투어
+
+```python title="main/aws_handler.py"
+@aws_handler_wrapper(use_traceback=False, error_receiver=slack_notify)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    body['source_ip'] = handler_util.get_source_ip(event, context)
+    body['user'] = _resolve_user(body)
+    cmd = body.pop('cmd')
+    return router(cmd, body, {}, allowed_cmd_prefixes=['main.controller'])
+```
+
+```python title="main/controller/user.py"
+@controller
+def get_profile(user, **kwargs):
+    if user is None:
+        raise errs.no_session
+    return {'name': user.name, 'birth': user.birth}
+```
+
+```python title="main/model/user.py"
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [('phone', None), ('google_social_id', None)]
+
+    name: str
+    phone: str = ' '              # sparse GSI: None 대신 한 칸 공백을 써요
+    google_social_id: str = ' '
+```
+
+각 조각은 이후 챕터에서 끝까지 풀어 설명해 드려요. 다음 정거장은 [sawsi란 무엇인가](/docs/introduction/about)예요.

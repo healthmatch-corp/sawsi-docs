@@ -1,0 +1,190 @@
+---
+title: Background workers & scheduling
+description: SQS workers, EventBridge schedules, and distributed locking — the three primitives for "not on the request path."
+---
+
+Some work is not request-shaped: cleaning up stale records, sending push notifications at 9am, processing video uploads. sawsi gives you three primitives for it.
+
+## SQS worker — async fan-out
+
+The pattern, end to end:
+
+### Sender
+
+```python title="main/service/event_service.py"
+def schedule_post_event_cleanup(event_id):
+    api.sqs.send_message(json.dumps({
+        'type': 'queue_receiver.controller.event_cleanup.run',
+        'body': {'event_id': event_id, 'after_ts': time.time() + 3600},
+    }))
+```
+
+Convention: the JSON has `type` (which becomes the cmd) and `body` (which becomes the controller arguments).
+
+### Worker
+
+```python title="queue_receiver/aws_handler.py"
+from concurrent.futures import ThreadPoolExecutor
+import json
+
+@handler_util.aws_handler_wrapper(use_traceback=True)
+def handler(event, context):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = []
+        for record in event['Records']:
+            msg = json.loads(record['body'])
+            futures.append(pool.submit(_one, msg['type'], msg.get('body', {})))
+        for f in futures:
+            f.result()        # re-raise to let SQS retry the whole batch
+    return None
+
+def _one(cmd, body):
+    return router(cmd, body, {}, allowed_cmd_prefixes=['queue_receiver.controller'])
+```
+
+```python title="queue_receiver/controller/event_cleanup.py"
+@controller
+def run(event_id: str, after_ts: float, **kwargs):
+    event = Event.get(event_id)
+    if not event or event.crt > after_ts:
+        return
+    event.is_archived = True
+    event.update()
+```
+
+### Failure handling
+
+If `_one` raises, the future call surfaces the exception, the SQS batch is marked as failed, and the message returns to the queue for retry (up to the queue's redrive policy). Configure a Dead-Letter Queue at the queue level for messages that fail repeatedly.
+
+To avoid retries for specific kinds of failure:
+
+```python
+def _one(cmd, body):
+    try:
+        return router(cmd, body, {}, allowed_cmd_prefixes=['queue_receiver.controller'])
+    except errs.permanently_invalid:
+        log_and_swallow(cmd, body)
+        return None
+```
+
+### Picking the worker count
+
+`max_workers=4` is a starting point. The constraint is usually downstream rate limits (DynamoDB capacity, third-party APIs). The Lambda's own concurrency limit is independent and controlled via the SQS event source mapping `BatchSize` and `MaximumConcurrency`.
+
+## EventBridge Scheduler — periodic jobs
+
+One Lambda function that EventBridge wakes once per minute. The handler runs many cron-matched jobs in parallel using `ScheduledTask`:
+
+```python title="scheduler/aws_handler.py"
+from sawsi.shared.schedule_util import ScheduledTask, join
+
+def handler(event, context):
+    # Every minute
+    with ScheduledTask('* * * * *') as do:
+        from scheduler.controller import bots
+        do(bots.tick)
+
+    # Every 10 minutes
+    with ScheduledTask('*/10 * * * *') as do:
+        from scheduler.controller import meal
+        do(meal.send_meal_reminders)
+
+    # Hourly at :01
+    with ScheduledTask('1 * * * *') as do:
+        from scheduler.controller import match
+        do(match.send_pre_match_notifications)
+
+    # Daily at 09:00 KST (server runs UTC)
+    with ScheduledTask('0 0 * * *') as do:
+        from scheduler.controller import daily
+        do(daily.run)
+
+    # Friday 20:00
+    with ScheduledTask('0 11 * * 5') as do:
+        from scheduler.controller import weekly
+        do(weekly.summary)
+
+    join()
+    return None
+```
+
+### How `ScheduledTask` works
+
+On `__enter__`, it evaluates the cron expression against `datetime.utcnow()`. If the current minute matches, `do(callable)` schedules the function on a background thread. Otherwise `do` is a no-op.
+
+`join()` waits for all background threads launched in this invocation. Without it, the Lambda may exit before the thread finishes, killing the work.
+
+### Timezone
+
+Cron expressions evaluate against **UTC** (Lambda's clock). Compute the offset yourself for KST or local-time jobs. For example, 09:00 KST is 00:00 UTC: `'0 0 * * *'`.
+
+### Avoiding double-runs
+
+A job scheduled `'0 9 * * *'` runs at 9:00:00, 9:00:01, ... 9:00:59 if EventBridge fires the Lambda every minute. The cron check is minute-resolution, so the cron block fires **once per matching minute**, but the Lambda invocation may itself happen multiple times within that minute if EventBridge double-fires.
+
+To make jobs idempotent, key them by `(date, hour, minute)`:
+
+```python
+@controller
+def run(**kwargs):
+    key = datetime.utcnow().strftime('daily-%Y-%m-%d')
+    with api.locking.lock(key, max_alive_ts=300, max_retries=1):
+        # the actual job
+        ...
+```
+
+If the second invocation hits the lock, the second one is a no-op.
+
+## Distributed locking — `LockingAPI`
+
+DynamoDB-backed locks for cross-Lambda serialization. The lock table has a conditional `put_item` with TTL.
+
+```python
+with api.locking.lock(
+    object_key='register_phone_+82-10-1234-5678',
+    max_alive_ts=30,         # lock auto-expires after 30s
+    max_retries=3,            # retry up to 3 times to acquire
+    wait_time=2,              # sleep 2s between retries
+):
+    # critical section
+    ...
+```
+
+When to use:
+
+- **Race-prone "check then write"** — e.g. OAuth register checking for an existing user.
+- **Once-per-period jobs** running in scheduler that shouldn't double-execute.
+- **Per-user rate limiting** for actions where bypassing is unacceptable.
+
+When not to use:
+
+- For DynamoDB *items*, prefer optimistic concurrency (`ConditionExpression`) — cheaper, no separate lock table read.
+- For UI button double-click prevention — too coarse, too slow.
+
+## Combining the three
+
+A common pattern in production:
+
+1. **API request** receives an action that needs background processing.
+2. **API handler** does the immediate-feedback part (e.g. mark as "pending") and enqueues an SQS message.
+3. **SQS worker** picks up the message, acquires a lock on the user (or resource), does the heavy work, releases.
+4. **Scheduler** periodically scans for "stuck pending" rows and re-enqueues them.
+
+This gives users a fast response, the worker fan-out scales, the lock prevents duplicate processing, and the scheduler catches everything that fell through.
+
+## Cost notes
+
+- SQS: cheap. ~$0.40 per million messages.
+- EventBridge: free at this rate (you're using one rule per minute).
+- Locking: every lock acquire is two DynamoDB writes (try-put + delete). For very high churn, batch your critical sections.
+
+## Next
+
+<Cards>
+  <Card title="Multi-Lambda layout" href="/docs/architecture/multi-lambda">
+    How these workers coexist with the user API in one project.
+  </Card>
+  <Card title="Observability" href="/docs/architecture/observability">
+    Watching the queue, the schedule, and the lock churn.
+  </Card>
+</Cards>

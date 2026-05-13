@@ -1,0 +1,177 @@
+---
+title: Security posture
+description: A consolidated checklist — routing, sessions, secrets, IAM, traceback, and the GSI NULL trap.
+---
+
+This page is the consolidated security checklist for a sawsi project. Most items are covered in detail in other chapters; this one is the audit-time view.
+
+## Routing perimeter
+
+- `allowed_cmd_prefixes` is **the** routing security gate. Never empty, never `['*']`.
+- User-facing Lambda allows only `<app>.controller.*`. Admin Lambda allows only `admin.controller.*`. Never overlap.
+- Webhook receivers narrow further — only the cmds that match expected providers.
+
+See [Request lifecycle](/docs/handlers/request-lifecycle).
+
+## Session and OTP
+
+- Session id alone is **insufficient** — pair it with `o_c` (per-request OTP code) when `use_secure=True`.
+- `otp_secret` is sent to the client **once** at login, never echoed back.
+- Sessions store `ts_offset` so the OTP window tolerates client clock skew.
+- A leaked session id without `otp_secret` is useless; a captured `o_c` is useless after 45 seconds.
+
+See [Sessions](/docs/auth/sessions).
+
+## OAuth
+
+- Match users by `social_id` (`sub`), never by email.
+- **Re-verify** `id_token` inside the register controller — do not trust the login response.
+- Apple bundle id list must include both dev and prod ids.
+- Google `email_verified` is a string `'true'`, not a boolean.
+
+See [OAuth & social login](/docs/auth/oauth).
+
+## Admin
+
+- Admin lives in a separate Lambda with `allowed_cmd_prefixes=['admin.controller']`.
+- Non-`root`/`master` access is gated by `AdminGroup.allow_cmds` × `allow_ips`.
+- Destructive ops (account deletion, purge) are gated independently in the handler — not via group rules.
+
+See [Admin sub-system](/docs/auth/admin).
+
+## Sparse GSI / NULL trap
+
+- GSI key fields must use `str = ' '` (single space), never `Optional[str] = None`.
+- DynamoDB will reject `NULL` attributes on indexed fields with `ValidationException`.
+- Check "is set" with `field.strip()`, not `if field`.
+
+See [DynamoModel](/docs/data/dynamomodel).
+
+## IAM perimeter
+
+- Every resource ARN in the policy is scoped by env prefix.
+- `aws_iam_policy_dev.json` and `aws_iam_policy_prod.json` differ only by env tokens.
+- Both files are updated in the same commit when permissions change.
+- CodeBuild service role ≠ Lambda execution role. Don't conflate them.
+
+See [IAM](/docs/deployment/iam).
+
+## Secrets
+
+- All secrets live in `{env}/{project}` in Secrets Manager — never in source.
+- The `SecretManagerAPI` instance caches values; cache invalidation requires container recycle.
+- Rotating a secret in AWS does not invalidate warm Lambda containers until they recycle.
+
+See [AWS service wrappers](/docs/services/aws-wrappers) and [Lazy initialization](/docs/deployment/lazy-loading).
+
+## Response shape
+
+- `use_traceback=False` in prod. Tracebacks expose file paths, line numbers, and variable names.
+- Application error codes start at `B10000`+ or use category prefixes that don't collide with library codes (`B0xxxx`).
+- `rslt_msg` is an English-ish stable identifier; localize on the client.
+
+See [Errors & result codes](/docs/architecture/errors).
+
+## Webhooks
+
+- Verify the **raw body signature** before parsing. The wrapper hands you `event['body']` as a string — keep it for verification.
+- Provider-specific secret (HMAC key, JWT public key) lives in Secrets Manager.
+- Re-verify on every request; never cache "trusted source" status.
+
+See [Triggers — Webhook receiver](/docs/handlers/triggers).
+
+## Input validation
+
+- Pydantic types in controller signatures handle syntactic validation automatically.
+- Semantic validation (uniqueness, range, format) goes in the controller; raise `AppError` for failures.
+- Phone numbers are normalized **before** uniqueness checks (`phone_util.normalize_phone_number`).
+
+## Rate limiting
+
+- Password retry counters per phone — block at 5 failures in a window.
+- OAuth register is locked per `social_id` to prevent concurrent duplicate user creation.
+- High-traffic public endpoints (search, autocomplete) sit behind API Gateway throttling.
+
+## Audit logging
+
+- Admin actions are logged to Firehose with `(admin_id, cmd, body, ts)`.
+- User-level audit events (password change, OAuth disconnection, account deletion) follow the same pattern.
+
+See [Observability](/docs/architecture/observability).
+
+## Per-Lambda concurrency
+
+- Critical user-facing Lambdas have Reserved Concurrency so they cannot be starved by a noisy worker.
+- Admin Lambda has its own concurrency cap — usually small, since admin volume is low.
+
+## Cold-start surface
+
+- `api.py` does no AWS work at import — all wrappers are `LazyLoadedAPI`.
+- Don't call AWS at module top level (`ALLOWED_IPS = api.secret_manager.get_secret_value(...)` is wrong).
+- Profile cold starts in dev before chasing them in prod.
+
+## What is *outside* this list
+
+The sawsi conventions don't cover:
+
+- WAF configuration on API Gateway (rate limiting at the edge).
+- VPC integration (most sawsi projects are non-VPC for simplicity).
+- DDoS protection (Shield Standard is on by default; Advanced is an org-level decision).
+- Cross-region replication and disaster recovery.
+- Audit trails beyond Firehose (CloudTrail at the account level).
+
+These are real concerns, just not framework-specific. Add them at the AWS-account layer.
+
+## Pre-launch audit checklist
+
+Use this as a one-pager before turning on prod traffic:
+
+```
+ROUTING
+[ ] allowed_cmd_prefixes is non-empty, non-wildcard, per-Lambda
+[ ] Admin and user Lambdas have disjoint prefixes
+[ ] no-session whitelist is small and explicit
+
+SESSIONS
+[ ] All new sessions use _create_user_session_secure (not legacy)
+[ ] use_secure=True for new sessions
+[ ] OTP window covers expected client clock skew
+
+OAUTH
+[ ] Each provider matches by social_id, not email
+[ ] register controller re-verifies id_token
+[ ] Apple bundle ids include dev and prod
+
+ADMIN
+[ ] AdminGroup whitelists are populated for each manager
+[ ] root/master accounts are limited to operations team
+[ ] ROOT_ONLY_CMDS list is gated in the handler
+
+DATA
+[ ] No Optional[str] = None on any GSI key field
+[ ] All sparse fields use ' ' default with .strip() checks
+[ ] No FilterExpression in user-facing paths
+
+IAM
+[ ] dev and prod policies match in structure
+[ ] No bare wildcard resources
+[ ] Per-service permissions match what api.py actually uses
+
+SECRETS
+[ ] No hardcoded secrets in source
+[ ] All secrets paths follow {env}/{project}
+[ ] CodeBuild role can write to Secrets if rotation is automated
+
+DEPLOY
+[ ] use_traceback=False in prod handlers
+[ ] Application error codes don't overlap A/U/B0xxxx
+[ ] error_receiver is wired to a real alert channel
+[ ] Both buildspec-{env}.yml files have matching LAMBDAS arrays
+
+OBSERVABILITY
+[ ] Firehose stream initialized for business events
+[ ] CloudWatch alarms set on error rate and latency
+[ ] Cold-start metric included in logs
+```
+
+This list is short on purpose. Each item links into the chapter where it's fully covered.

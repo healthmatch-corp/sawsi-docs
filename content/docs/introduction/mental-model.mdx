@@ -1,0 +1,155 @@
+---
+title: Mental model
+description: The shapes you carry into every chapter that follows.
+---
+
+If you only memorize five shapes from this handbook, memorize the ones below. Every page later in the manual is a refinement of these.
+
+## 1. The request lifecycle is a straight line
+
+```
+API Gateway → aws_handler.handler → @aws_handler_wrapper → router() → @controller → service → DynamoModel
+```
+
+There is no middleware framework, no dependency injection container, no class-based views. Each box does one thing and the box to its left passes plain Python values to the box on its right.
+
+The wrapper does response shaping. The router does dispatch. The controller does request validation. The service does business logic. The model does I/O. **Pages later in the handbook drill into individual boxes; the line shape stays.**
+
+## 2. `api.py` is the singleton pool
+
+Every AWS resource the app touches is declared **once** in `api.py`:
+
+```python title="api.py"
+from sawsi.aws.dynamodb.api import DynamoDBAPI
+from sawsi.aws.s3.api import S3API
+from sawsi.aws.secrets_manager.api import SecretManagerAPI
+from sawsi.shared.class_util import LazyLoadedAPI
+import config
+
+env = config.env
+project_name = 'myproject'
+
+dynamo: DynamoDBAPI = LazyLoadedAPI(DynamoDBAPI, f'{env}-{project_name}', region=config.region)
+s3_public: S3API = LazyLoadedAPI(S3API, f'{env}-{project_name}-public', region=config.region)
+secret_manager: SecretManagerAPI = LazyLoadedAPI(SecretManagerAPI, f'{env}/{project_name}', region=config.region)
+```
+
+Everywhere else in the codebase:
+
+```python
+import api
+
+api.dynamo.put_item(...)
+api.s3_public.upload_file(...)
+```
+
+The wrappers are wrapped in `LazyLoadedAPI` so that **importing `api.py` does not create connections**. The first attribute access on each handle triggers the actual constructor, behind a thread lock. This matters for Lambda cold start and for build-time scripts that should not need AWS credentials.
+
+[Deep dive: Lazy initialization & cold start](/docs/deployment/lazy-loading).
+
+## 3. Resources are named `{env}-{project}[-{suffix}]`
+
+Every AWS resource — DynamoDB tables, S3 buckets, Locking tables, Firehose streams, SQS queues — follows this pattern:
+
+| Resource | Name |
+|---|---|
+| DynamoDB table prefix | `dev-myproject` (table names become `dev-myproject_user`, `dev-myproject_event`, …) |
+| S3 (public assets) | `dev-myproject-public` |
+| S3 (private uploads) | `dev-myproject-uploads` |
+| Locking table | `dev-myproject-locking` |
+| Firehose stream | `dev-myproject-firehose` |
+| Secrets Manager secret | `dev/myproject` |
+
+This is not aesthetic — it is **load-bearing**. The IAM policies (`aws_iam_policy_dev.json`, `aws_iam_policy_prod.json`) grant access by exact resource ARN pattern. Break the convention and you get a permission error in prod that you did not get in dev.
+
+## 4. `build_keeper.py` runs **once per release**
+
+```python title="build_keeper.py"
+import api
+import config
+from sawsi.model.base import sync_all_models
+
+def run():
+    config.build = True
+
+    sync_all_models(['main.model'])      # 1. Create/migrate DynamoDB tables + GSIs
+    api.locking.init_table()              # 2. Create locking table
+    api.firehose_log.init()               # 3. Create Firehose stream + IAM role (sleeps 4s for propagation)
+    api.s3_public.init_s3_bucket(acl='public-read')   # 4. Create S3 bucket
+
+if __name__ == '__main__':
+    run()
+```
+
+It runs during `docker build` (the Dockerfile invokes it as a `RUN` step) so the image hits AWS to ensure all resources exist before the Lambda is updated to point at the new image.
+
+The order is not arbitrary:
+
+1. `sync_all_models` first — it creates the DynamoDB tables that everything else may depend on.
+2. `locking.init_table()` — depends on DynamoDB existing.
+3. `firehose_log.init()` — creates an IAM role; needs a 4-second sleep before any `put_record` will succeed because IAM is eventually consistent.
+4. `s3_public.init_s3_bucket()` — independent, but kept last so failures here don't block table creation.
+
+Everything in `build_keeper.py` must be **idempotent**. It runs on every deploy.
+
+## 5. DynamoModel has automatic fields you don't redefine
+
+```python
+@sync
+class User(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = 'user'
+    _indexes = [('phone', None)]
+
+    name: str
+    phone: str = ' '
+```
+
+Behind your fields, every model gets three automatic ones:
+
+- `id: str` — UUID4, the partition key.
+- `crt: float` — created timestamp, the default sort key.
+- `u_b: str` — always `'_'`, used as the partition key of a built-in GSI that lets you query "all rows" in time order.
+
+Do **not** redefine these. The framework relies on their presence and defaults.
+
+The other thing to internalize: sparse-GSI fields use `str = ' '` (one space) as their default, never `Optional[str] = None`. DynamoDB rejects `NULL` in indexed attributes, and a literal blank string makes the GSI effectively sparse. The full reasoning is in [DynamoModel](/docs/data/dynamomodel).
+
+## 6. Triggers are first-class but uniform
+
+A sawsi project can have many Lambdas, each with its own `aws_handler.py`. The CLI helps:
+
+```bash
+awsi add queue_receiver -t sqs
+awsi add scheduler -t ebs
+awsi add websocket_receiver -t ws
+```
+
+Each trigger has a slightly different event shape (SQS gives you `Records`, EventBridge gives you a near-empty event, WebSocket gives you `connectionId`), but the **body of the handler** still ends in a `router(...)` call (or a `ScheduledTask(...) with do(...)` pattern for the EventBridge case). The conventions in this chapter apply identically.
+
+See [Triggers](/docs/handlers/triggers) for the per-trigger details.
+
+## Putting it together
+
+The smallest mental picture you can carry:
+
+```
+        ┌────────────────────────────────────────────────┐
+        │             api.py (LazyLoadedAPI)             │   ← all AWS clients
+        └────────────────────────────────────────────────┘
+                          ▲
+                          │ used by
+        ┌──────────────┐  │  ┌──────────────────────────┐
+        │   trigger    │──┴──│  controller → service     │
+        │ (agw/sqs/…)  │     │       ↓                   │
+        └──────┬───────┘     │     DynamoModel           │
+               │             └──────────────────────────┘
+               │
+       @aws_handler_wrapper
+               │
+            router()   ← allowed_cmd_prefixes gate
+               │
+         @controller
+```
+
+Carry this picture into every next chapter.

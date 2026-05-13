@@ -1,0 +1,214 @@
+---
+title: Testing & local dev
+description: Flask adapter, mocking AWS, and how to keep build_keeper.py idempotent under test.
+---
+
+sawsi doesn't ship a testing framework. The framework's choice of plain Python functions (controllers, services) and a simple `event → dict` request shape means standard tools — pytest, moto, a Flask adapter — are enough.
+
+## Local development with a Flask adapter
+
+The Lambda runtime model — `event` dict in, response dict out — is easy to fake in any web server. The minimal Flask adapter:
+
+```python title="local_server_main.py"
+from flask import Flask, request, jsonify
+import json, time, os
+
+os.environ.setdefault('env', 'dev')
+os.environ.setdefault('AWS_DEFAULT_REGION', 'ap-northeast-2')
+
+from main.aws_handler import handler
+
+app = Flask(__name__)
+
+@app.route('/', methods=['OPTIONS'])
+def cors():
+    r = jsonify({})
+    r.headers['Access-Control-Allow-Origin']  = '*'
+    r.headers['Access-Control-Allow-Methods'] = 'POST,OPTIONS'
+    r.headers['Access-Control-Allow-Headers'] = '*'
+    return r
+
+@app.route('/', methods=['POST'])
+def root():
+    body = request.get_json()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    # Mirror the API Gateway event shape
+    event = {
+        'body': json.dumps(body),
+        'headers': headers,
+        'requestContext': {
+            'requestId': 'local-dev',
+            'requestTimeEpoch': int(time.time() * 1000),
+            'identity': {'sourceIp': request.remote_addr},
+        },
+    }
+    response = handler(event, {})
+    inner = json.loads(response['body']) if 'body' in response else response
+    return jsonify(inner)
+
+if __name__ == '__main__':
+    app.run(port=8000, debug=True)
+```
+
+```bash
+env=dev python local_server_main.py
+```
+
+Then curl as if it were the real Lambda:
+
+```bash
+curl -X POST http://localhost:8000 \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd": "main.controller.system.health_check"}'
+```
+
+This adapter is *good enough* for 95% of local work — controllers run, DynamoDB queries hit dev tables, S3 uploads land in dev buckets.
+
+## Wiring into `npm run local`
+
+A `package.json` at the project root makes the loop ergonomic:
+
+```json title="package.json"
+{
+  "name": "myproject",
+  "private": true,
+  "scripts": {
+    "local":       "PYTHONPATH=. .venv/bin/python local_server_main.py",
+    "local:main":  "PYTHONPATH=. .venv/bin/python local_server_main.py",
+    "local:admin": "PYTHONPATH=. .venv/bin/python local_server_admin.py"
+  }
+}
+```
+
+## Unit testing controllers
+
+Controllers are plain Python functions. Test them directly:
+
+```python title="tests/test_member.py"
+import pytest
+from main.controller import member
+import errs
+
+def test_register_with_existing_phone_returns_already_registered(monkeypatch):
+    monkeypatch.setattr(
+        'main.controller.member.User.generate',
+        lambda **kw: iter([type('U', (), {'phone': kw['pk_value']})()]),
+    )
+    monkeypatch.setattr(
+        'main.controller.member.verify_token',
+        lambda *a, **kw: True,
+    )
+
+    result = member.register(
+        auth_token='t',
+        source_ip='127.0.0.1',
+        phone='01012345678',
+        password='pw',
+        name='Kim',
+        birth='1990-01-01',
+    )
+    assert result['status'] == 'already_registered'
+```
+
+The Pydantic types on the controller signature make Python's type-checker your first line of defense; the test catches the business logic on top.
+
+## Testing services
+
+Services often touch `api.*`. Two approaches:
+
+### Hit dev DynamoDB
+
+Simplest. Your tests insert rows into a dev table and read them back. The downside: tests are slower (network), and parallel test runs can step on each other.
+
+### Use moto
+
+`moto` intercepts boto3 calls and serves them from an in-process fake:
+
+```python title="tests/conftest.py"
+import pytest
+from moto import mock_aws
+
+@pytest.fixture(autouse=True)
+def aws_mock():
+    with mock_aws():
+        yield
+```
+
+```python title="tests/test_service.py"
+def test_event_score_recompute(aws_mock):
+    import api
+    api.dynamo.create_table('dev-myproject_event')   # within the moto fake
+    api.dynamo.put_item('dev-myproject_event', {'id': 'e1', 'crt': 0.0, 'u_b': '_'}, True)
+
+    from main.service.event_service import recompute_scores
+    recompute_scores()
+
+    item = api.dynamo.get_item('dev-myproject_event', 'e1')
+    assert item['score'] > 0
+```
+
+moto's DynamoDB fidelity is high (GSIs work). S3 and SQS are also well supported. For more exotic services (Firehose, Bedrock), mock the wrapper directly.
+
+## Testing `aws_handler.py` end to end
+
+Construct a Lambda-shaped event and call the handler:
+
+```python
+def test_health_check():
+    from main.aws_handler import handler
+    response = handler({
+        'body': '{"cmd":"main.controller.system.health_check"}',
+        'headers': {},
+        'requestContext': {'requestTimeEpoch': 0},
+    }, {})
+    body = json.loads(response['body'])
+    assert body['rslt_cd'] == 'A00000'
+```
+
+## `build_keeper.py` under test
+
+`build_keeper.py` is what creates AWS resources. Tests must not run it against prod by accident. Two safeguards:
+
+1. **`config.build = True` only inside `build_keeper.run()`** — and your controllers should never branch on `config.build`. The flag exists to signal "we're in the deploy build context."
+2. **Tests run with `env=test`** (or `env=dev` against a dev account). If your CI accidentally points at prod, `aws_iam_policy_test.json` doesn't grant write access to prod resources — IAM saves you.
+
+## Smoke test on a real deploy
+
+After a fresh deploy, run a one-liner against the API Gateway URL:
+
+```bash
+curl -sX POST https://<your-api>.execute-api.ap-northeast-2.amazonaws.com/default/dev_myproject_main_docker \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":"main.controller.system.health_check"}' | jq .
+```
+
+If `rslt_cd` is `A00000`, the deploy is alive. If you see `U99999` with a Python import error, something is wrong with the image. If you see `B00006`, your `allowed_cmd_prefixes` is misconfigured.
+
+A health-check controller is the cheapest thing you can write and the most valuable:
+
+```python title="main/controller/system.py"
+@controller
+def health_check(**kwargs):
+    return {
+        'status': 'ok',
+        'env': config.env,
+        'ts': time.time(),
+    }
+```
+
+## CI ergonomics
+
+A minimal CI on every push:
+
+1. `pip install -r requirements.txt`
+2. `pytest`
+3. (optional) `python build_keeper.py` against a `test` env account to verify the script doesn't crash.
+
+If `pytest` passes, CodeBuild kicks in on a merge to `main` and ships to dev.
+
+## What this is *not*
+
+- Not a story for end-to-end browser tests. Those are client concerns.
+- Not a story for load testing. Use `wrk` or `k6` against your dev API Gateway, separately.
+- Not a story for chaos engineering. AWS gives you that natively (random Lambda recycles).

@@ -1,0 +1,184 @@
+---
+title: For AI coding agents
+description: The agent-skills-sawsi harness — skills, slash commands, lint hook, and eval tasks for Claude Code and friends.
+---
+
+If you build sawsi projects with the help of an AI coding agent (Claude Code, Cursor, etc.), there is a separate package — `agent-skills-sawsi` — that teaches the agent the conventions documented in this handbook. This page is a tour of what's in it and how to use it.
+
+## What the harness ships
+
+```
+agent-skills-sawsi/
+├── .agents/
+│   ├── skills/
+│   │   ├── sawsi-conventions/      # api.py / build_keeper / env naming
+│   │   ├── sawsi-dynamomodel/      # DynamoModel ORM rules
+│   │   ├── sawsi-filter-exp/       # FilterExpression ban
+│   │   ├── sawsi-handler-and-router/   # @controller, router, response shape
+│   │   ├── sawsi-oauth/             # 2-step login/register pattern
+│   │   ├── sawsi-services/          # S3 / Locking / Firehose / SES / SMS / SQS / SecretsManager
+│   │   └── sawsi-deploy/            # buildspec + Docker + IAM
+│   ├── commands/
+│   │   ├── sawsi-add-controller.md  # /sawsi-add-controller
+│   │   └── sawsi-add-model.md       # /sawsi-add-model
+│   ├── hooks/
+│   │   └── sawsi_lint.py            # Stop-hook linter
+│   └── settings.json                # wires the hook
+├── templates/
+│   └── CLAUDE.md.template
+├── evals/
+│   └── tasks/                       # five regression scenarios
+└── README.md
+```
+
+## The seven skills
+
+Each is a single `SKILL.md` file the agent reads when it detects a relevant context. They map to chapters in this handbook:
+
+| Skill | Maps to |
+|---|---|
+| `sawsi-conventions` | [Mental model](/docs/introduction/mental-model), [Conventions](/docs/practice/conventions) |
+| `sawsi-dynamomodel` | [DynamoModel](/docs/data/dynamomodel) |
+| `sawsi-filter-exp` | [Filtering discipline](/docs/data/filtering) |
+| `sawsi-handler-and-router` | [Request lifecycle](/docs/handlers/request-lifecycle), [Triggers](/docs/handlers/triggers), [Errors](/docs/architecture/errors) |
+| `sawsi-oauth` | [OAuth & social login](/docs/auth/oauth) |
+| `sawsi-services` | [AWS service wrappers](/docs/services/aws-wrappers) |
+| `sawsi-deploy` | [Deployment](/docs/deployment/deployment), [IAM](/docs/deployment/iam) |
+
+The skills are condensed — bullets, code stubs, gotchas — so the agent can load them without spending context on full prose. Use them as a quick reference yourself if you prefer terse over narrative.
+
+## Two slash commands
+
+### `/sawsi-add-controller <app>.controller.<module>.<func_name>`
+
+Generates a controller stub:
+
+```python
+from sawsi.handler.controller_decorator import controller
+import errs
+
+@controller
+def <func_name>(<explicit_params>, **kwargs):
+    """
+    <one-line description>
+    """
+    # TODO: business logic
+    return {}
+```
+
+Enforces:
+
+- `@controller` decorator.
+- Named parameters (not unpacking `body`).
+- `**kwargs` absorbed.
+- `raise errs.*` for failures (not raw `Exception`).
+- No `statusCode`/`headers` in the return value.
+
+### `/sawsi-add-model <ModelName> [<field1>,<field2>,...]`
+
+Generates a DynamoModel stub:
+
+```python
+import api
+from sawsi.model.base import DynamoModel, sync
+
+@sync
+class <ModelName>(DynamoModel):
+    __dynamo__ = api.dynamo
+    _table = '<table_name>'
+    _indexes = [
+        ('<field1>', None),
+        ('<field2>', 'crt'),
+    ]
+
+    # TODO: add business fields
+```
+
+Enforces:
+
+- `@sync` (so `sync_all_models` finds it).
+- `__dynamo__ = api.dynamo`.
+- Doesn't redefine `id` / `crt` / `u_b`.
+
+## The lint hook
+
+`sawsi_lint.py` runs on the agent's Stop hook — every time the agent finishes a turn. It walks the git diff and flags:
+
+1. **`import boto3` or `from boto3 ...`** — should be `import api` plus `api.<service>`.
+2. **Hardcoded `'dev-...'` / `'prod-...'` resource strings** — should be `f'{env}-{project}-...'`.
+3. **DynamoModel subclass without `@sync`** — table won't be created.
+4. **Handler return value with a literal `statusCode` key** — wrapper will double-wrap.
+
+If anything matches, the hook blocks the agent's "task done" state with a structured error message; the agent must fix or justify before continuing.
+
+It deliberately does not try to lint everything — these four patterns are the most common newcomer mistakes. For the rest, the skills + a human reviewer cover it.
+
+## Five eval tasks
+
+`evals/tasks/` contains five scenarios used to regression-test changes to the harness:
+
+1. **Add a User model** — does the agent emit `@sync`, `__dynamo__`, correct `_indexes`, no field redefinition?
+2. **Paginate a User query** — does the agent return `(items, cursor)` and not use FilterExpression?
+3. **Login controller + handler integration** — does the agent define a new `errs.*`, use `@controller`, route through `allowed_cmd_prefixes`?
+4. **Fix a `.update()` NoOp bug** — does the agent recognize `__modified_attributes__` semantics and use `force_update_default_fields`?
+5. **Add a new S3 bucket** — does the agent update both `aws_iam_policy_dev.json` and `aws_iam_policy_prod.json`?
+
+When you change a skill or the hook, re-run these to make sure you haven't regressed.
+
+## How to install the harness in your project
+
+### Option A — vendor the files
+
+```bash
+cd /path/to/your/project
+cp -R /path/to/agent-skills-sawsi ./agent-skills-sawsi
+
+ln -s agent-skills-sawsi/.agents .claude
+cp agent-skills-sawsi/templates/CLAUDE.md.template ./CLAUDE.md
+```
+
+Edit `CLAUDE.md` to fill in your project-specific app names, triggers, and any non-standard patterns.
+
+### Option B — git submodule
+
+```bash
+git submodule add <agent-skills-sawsi-repo-url> agent-skills-sawsi
+git submodule update --init --recursive
+
+mkdir -p .agents/skills .agents/commands .agents/hooks
+ln -s .agents .claude
+
+for d in agent-skills-sawsi/.agents/skills/*; do
+  ln -s "../../$d" ".agents/skills/$(basename "$d")"
+done
+# similarly for commands and hooks
+```
+
+This lets you `git submodule update --remote` to pull harness updates without copying files.
+
+## The CLAUDE.md.template
+
+Lives at `templates/CLAUDE.md.template`. After copying to your project root, fill in:
+
+- Project name and AWS region.
+- Which apps you have (`main`, `admin`, `queue_receiver`, etc.) and their triggers.
+- Which AWS services are declared in `api.py`.
+- The `cmd` prefix conventions you use.
+- Any project-specific non-standard patterns the agent should know about.
+
+The harness's CLAUDE.md is read **before** the skills, so anything you write there can override or refine the skills' default guidance.
+
+## Where this fits
+
+The agent harness is **not** the framework. It is a layer on top that helps an AI agent (or a new human team member) ship sawsi code that respects the conventions. The conventions themselves live in this handbook.
+
+If you don't use AI agents, the harness is harmless — just ignore the `.claude/` directory. If you do, install it once and your agent gets the same instincts a senior sawsi developer has after a year.
+
+## Reporting issues
+
+Two repos:
+
+- Framework bugs: `simple-aws-interface` issues.
+- Harness improvements: `agent-skills-sawsi` issues.
+
+A skill that doesn't match what this handbook says is a bug — file it.

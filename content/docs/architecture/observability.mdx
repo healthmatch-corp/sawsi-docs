@@ -1,0 +1,167 @@
+---
+title: Observability
+description: Logging, alerting, tracing, and the cold-start signal that ships with every handler.
+---
+
+sawsi has no opinion about your observability vendor — only opinions about **where the signal comes from**. Here are the four signals every project gets for free, and the patterns to layer on top.
+
+## 1. CloudWatch Logs (free)
+
+Every `print()`, every `logging.info()`, and the entire stdout/stderr of the Lambda lands in CloudWatch Logs under `/aws/lambda/<function-name>`. No setup needed.
+
+For each request, the wrapper itself doesn't emit a log line — by design, to keep cold-path overhead near zero. If you want a request log, emit it manually in the handler:
+
+```python
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    cmd = body.get('cmd')
+    print(json.dumps({
+        'event': 'request',
+        'cmd': cmd,
+        'source_ip': handler_util.get_source_ip(event, context),
+        'ts': time.time(),
+    }))
+    ...
+```
+
+JSON-format every log line. CloudWatch Logs Insights can then filter and aggregate.
+
+## 2. Structured logs to S3 via Firehose
+
+For long-term retention and analytics, route logs through `api.firehose_log`:
+
+```python
+api.firehose_log.put_record(json.dumps({
+    'event': 'event_join',
+    'user_id': user.id,
+    'event_id': event.id,
+    'duration_ms': int(duration * 1000),
+    'ts': time.time(),
+}))
+```
+
+Firehose buffers and dumps to S3 every ~5 minutes. From there, Athena or your warehouse picks it up.
+
+This is the right place for **business events** (signups, purchases, joins, churn signals). CloudWatch Logs is the right place for **debug output**.
+
+## 3. Cold-start tracking
+
+A common pattern at the top of `aws_handler.py`:
+
+```python
+import time
+COLD_START_AT = time.time()
+COLD = True
+
+@aws_handler_wrapper(...)
+def handler(event, context):
+    global COLD
+    cold_start = COLD
+    COLD = False
+    ...
+    # include cold_start in your logs
+```
+
+The Python module loads once per container — so `COLD_START_AT` is set when the container is freshly initialized. Every subsequent invocation inside the same container is warm. Emitting this signal lets you see how often your traffic hits cold paths.
+
+## 4. Slack/Discord error notifications
+
+`error_receiver` in `@aws_handler_wrapper` is your alert pipe. Slack is the most common destination:
+
+```python title="shared/slack/notifier.py"
+import requests
+
+def slack_notify(message: str):
+    try:
+        requests.post(
+            SLACK_WEBHOOK_URL,
+            json={'text': f'```{message[:2000]}```'},
+            timeout=2,
+        )
+    except Exception:
+        pass   # never let the notifier itself page on-call
+
+@aws_handler_wrapper(error_receiver=slack_notify, ignore_app_errors=[...])
+def handler(event, context):
+    ...
+```
+
+Two rules:
+
+- **Set a timeout** on the HTTP call. A slow Slack endpoint should not stretch your Lambda execution.
+- **Swallow exceptions** in the notifier. If Slack is down, you still want the Lambda to respond — just without the notification.
+
+## 5. X-Ray (optional)
+
+Enable AWS X-Ray on the Lambda function (in the AWS console) and grant X-Ray write permissions in the IAM policy. The SDK auto-instruments boto3 calls, so each AWS SDK call shows up as a sub-segment.
+
+For custom segments inside your code:
+
+```python
+from aws_xray_sdk.core import xray_recorder
+
+@xray_recorder.capture('compute_match_score')
+def compute_match_score(user_a, user_b):
+    ...
+```
+
+X-Ray costs a small amount per million traces but gives you per-request flame graphs.
+
+## What the wrapper measures
+
+Every response has a `duration` field — wall-clock seconds for the handler. This is the cheapest latency signal you can imagine. Aggregate by `cmd` in Athena:
+
+```sql
+select cmd, count(*), avg(duration), approx_percentile(duration, 0.95)
+from request_logs
+where date = '2026-05-13'
+group by cmd
+order by avg(duration) desc;
+```
+
+## SLOs / on-call
+
+A starting set of alerts:
+
+| Alert | Condition |
+|---|---|
+| Error rate spike | `rslt_cd` starts with `U` more than 1% of requests over 5 min |
+| Latency regression | p95 `duration` for any cmd doubles over baseline for 10 min |
+| Worker backlog | SQS `ApproximateNumberOfMessagesVisible` > N for 10 min |
+| Scheduler missed runs | EventBridge invocation count drops below 1 per minute for 5 min |
+| Firehose lag | Records-in vs records-delivered gap > 10× normal |
+
+CloudWatch Alarms can be configured against any metric and posted to the same Slack webhook.
+
+## Per-Lambda concurrency
+
+CloudWatch metric `Concurrent Executions` per function shows how many containers are alive. Compare against your account-wide limit (1,000 by default) to understand whether you're approaching it.
+
+Reserved Concurrency on a critical function isolates it from the rest of the fleet — useful for user-facing endpoints that must not be starved by a noisy worker.
+
+## Cost as a signal
+
+Two cost lines drift before functional ones:
+
+- **DynamoDB on-demand**. A spike in RCU/WCU often precedes a perf issue.
+- **Lambda duration**. A regression in `duration` shows up as more GB-seconds.
+
+Set CloudWatch billing alarms on both at the granularity that matches your scale.
+
+## Dashboards
+
+A minimal CloudWatch dashboard per environment:
+
+- Lambda invocations + errors + duration per function.
+- API Gateway 4xx and 5xx counts.
+- DynamoDB consumed capacity per table.
+- SQS visible/in-flight counts per queue.
+
+Add Firehose / S3 byte counts if you're paying attention to log volume.
+
+## What this is *not*
+
+- Not a tracing framework. X-Ray is integrated but optional; sawsi doesn't ship its own.
+- Not a metrics library. There is no `metric.inc('login.success')` shorthand. Emit structured logs to Firehose and aggregate in your warehouse.
+
+If you want one of those, layer it. The sawsi convention is: keep the framework small, keep the signal in your data plane (logs, S3, DynamoDB), and aggregate downstream.

@@ -1,0 +1,181 @@
+---
+title: Getting started
+description: From zero to a running sawsi Lambda in fifteen minutes.
+---
+
+This is the shortest path from an empty directory to a Lambda function answering a `cmd` request.
+
+## 0. Prerequisites
+
+- Python 3.12 (Lambda's current runtime).
+- An AWS account with permissions to create ECR repositories, Lambda functions, IAM roles, and DynamoDB tables.
+- The AWS CLI configured with credentials for the account you plan to deploy into.
+- Docker (for the container-image deploy path).
+
+<Callout>
+You can develop and write code without AWS access. Only the deploy step (covered in [Deployment](/docs/deployment/deployment)) needs cloud credentials.
+</Callout>
+
+## 1. Install the CLI
+
+```bash
+pip install sawsi
+```
+
+This installs the library and registers the `awsi` command on your PATH.
+
+## 2. Scaffold a project
+
+```bash
+awsi init myproject main
+```
+
+That creates:
+
+```
+.
+├── api.py                   # Singleton pool of AWS service clients
+├── config.py                # env, region, build flag, environment-scoped constants
+├── errs.py                  # AppError instances unique to this project
+├── build_keeper.py          # Runs once per deploy: sync tables, init buckets
+├── requirements.txt
+├── Dockerfile               # Container image used by Lambda
+├── buildspec-{lambda,docker}-{dev,prod}.yml
+├── aws_iam_policy_{dev,prod}.json
+└── main/
+    ├── aws_handler.py        # Lambda entrypoint for API Gateway
+    ├── controller/
+    │   └── auth.py           # Example @controller
+    ├── service/
+    │   └── auth_service.py
+    └── model/
+        └── sample_user.py    # Example DynamoModel
+```
+
+Open `api.py` and replace the `{{project}}` placeholders with `myproject` (the CLI does this automatically — verify it did).
+
+## 3. Read the generated handler
+
+```python title="main/aws_handler.py"
+from sawsi.shared import handler_util
+from sawsi.handler.router import router
+import errs
+
+@handler_util.aws_handler_wrapper(
+    error_receiver=lambda errmsg: print(errmsg),
+    content_type='application/json',
+    use_traceback=True,
+    ignore_app_errors=[errs.no_session],
+)
+def handler(event, context):
+    body = handler_util.get_body(event, context)
+    headers = handler_util.get_headers(event, context)
+    body['source_ip'] = handler_util.get_source_ip(event, context)
+    cmd = body.pop('cmd')
+    return router(cmd, body, headers, allowed_cmd_prefixes=['main.controller'])
+```
+
+Three things to notice:
+
+- `@aws_handler_wrapper` wraps the function so any return value or `AppError` is converted into a properly-shaped API Gateway response.
+- `router()` dispatches based on the `cmd` field in the request body.
+- `allowed_cmd_prefixes` is a security gate: only `cmd` strings that start with `main.controller.*` are accepted.
+
+## 4. Add your first controller
+
+```python title="main/controller/hello.py"
+from sawsi.handler.controller_decorator import controller
+
+@controller
+def say_hello(name: str = 'world', **kwargs):
+    return {'message': f'Hello, {name}!'}
+```
+
+That's it. No registration, no routing table. The `@controller` decorator adds the function to a registry keyed by `module.function_name`, and the router finds it.
+
+The request that reaches this controller looks like:
+
+```json
+{
+  "cmd": "main.controller.hello.say_hello",
+  "name": "sawsi"
+}
+```
+
+## 5. Run locally
+
+Create a tiny Flask adapter (the production project uses one — see [hm-serverless `local_server_main.py`](https://github.com/syc-weapon/hm-serverless/blob/master/local_server_main.py) for a reference):
+
+```python title="local_server.py"
+from flask import Flask, request, jsonify
+import json, time
+import os
+os.environ.setdefault('env', 'dev')
+from main.aws_handler import handler
+
+app = Flask(__name__)
+
+@app.post('/')
+def root():
+    event = {
+        'body': json.dumps(request.get_json()),
+        'headers': dict(request.headers),
+        'requestContext': {'requestTimeEpoch': int(time.time() * 1000)},
+    }
+    return jsonify(handler(event, {}))
+
+if __name__ == '__main__':
+    app.run(port=8000, debug=True)
+```
+
+```bash
+env=dev python local_server.py
+```
+
+Then:
+
+```bash
+curl -X POST http://localhost:8000 \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd": "main.controller.hello.say_hello", "name": "sawsi"}'
+```
+
+You should get:
+
+```json
+{
+  "rslt_cd": "A00000",
+  "rslt_msg": "요청 성공",
+  "duration": 0.012,
+  "message": "Hello, sawsi!"
+}
+```
+
+The `rslt_cd`/`rslt_msg`/`duration` envelope is added by `@aws_handler_wrapper`. See [Errors & result codes](/docs/architecture/errors) for the full code system.
+
+## 6. What just happened
+
+Top to bottom:
+
+1. The Flask adapter built a fake API Gateway `event` dict and called `handler(event, {})`.
+2. `@aws_handler_wrapper` extracted the body, timed the call, and prepared the response envelope.
+3. The handler called `router(cmd, body, headers, allowed_cmd_prefixes)`.
+4. The router verified that `cmd` starts with `main.controller.`, then looked up `main.controller.hello.say_hello` in the controller registry.
+5. The router inspected `say_hello`'s signature, matched the `name` key from `body`, and called `say_hello(name='sawsi')`.
+6. The return dict was merged into the envelope and returned.
+
+That's the entire request lifecycle. The rest of this handbook fills in the boxes around it.
+
+## Next
+
+<Cards>
+  <Card title="Mental model" href="/docs/introduction/mental-model">
+    Pin down the shapes you'll see for every feature.
+  </Card>
+  <Card title="The awsi CLI" href="/docs/cli">
+    More on `init` and on adding triggers with `add -t {agw|sqs|ebs|ws|webhook}`.
+  </Card>
+  <Card title="DynamoModel ORM" href="/docs/data/dynamomodel">
+    Define your first model with GSIs and persist it.
+  </Card>
+</Cards>

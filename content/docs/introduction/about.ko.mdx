@@ -1,0 +1,61 @@
+---
+title: sawsi란 무엇인가
+description: 설정 대신 컨벤션을 내장한 AWS 람다 백엔드용 Python 프레임워크예요.
+---
+
+## 한 줄 답
+
+sawsi는 AWS 네이티브 서버리스 백엔드를 만들기 위한 Python 프레임워크예요. `cmd` 기반 라우터, DynamoDB ORM, 균일한 AWS 서비스 래퍼 묶음, 그리고 컨테이너 이미지 배포 흐름 — 이 모두를 적은 수의 강한 컨벤션으로 엮어 줘요.
+
+## 어떤 문제를 푸는가
+
+모든 Lambda-on-AWS 프로젝트는 독립적으로 같은 여섯 가지를 다시 발견하곤 해요:
+
+1. **요청이 어떻게 라우팅되는지** — 보통 손으로 짠 `if cmd == ...` 체인이 천 줄짜리 핸들러로 자라나요.
+2. **DynamoDB 아이템이 어떻게 모델링되는지** — `boto3.client('dynamodb').put_item(...)`이 코드 전체에 흩어져요.
+3. **AWS 클라이언트가 어떻게 생성되는지** — 함수마다 `boto3.client('s3')` — 매번 콜드스타트 비용을 내요.
+4. **시크릿이 어떻게 로드되는지** — 한 팀은 메모리 캐싱, 다른 팀은 요청마다 Secrets Manager 호출이에요.
+5. **릴리스가 리소스를 어떻게 초기화하는지** — 콘솔에서 손으로 GSI 만들고, dev/prod가 어긋나요.
+6. **환경이 어떻게 분리되는지** — 여기에 `if env == 'prod'`를 넣을지, 저기에 다른 버킷명을 쓸지 추측해요.
+
+sawsi는 여섯 가지 모두에 대해 입장을 가져요. 입장은 때로 사소하고(래퍼 클래스, 네이밍 규칙) 때로 핵심적이지만(요청 라이프사이클 전체, DynamoModel ORM), **모든 프로젝트에서 항상 같은 입장**이라는 점이 이 프레임워크를 유용하게 만들어요.
+
+## 무엇이 아닌가
+
+- **REST 프레임워크가 아니에요.** sawsi는 경로 기반 라우팅을 완전히 거부해요. 단일 API Gateway 엔드포인트가 `{"cmd": "main.controller.user.get_profile", ...}`을 담은 JSON body를 받고, 라우터가 Python 모듈 경로로 디스패치해요. path variable 없음, method 매칭 없음이에요.
+- **멀티 클라우드 추상화가 아니에요.** 모든 래퍼가 AWS 전용이에요. 핵심은 이식성이 아니라 AWS 풍의 코드를 일관되게 만드는 것이에요.
+- **비동기 프레임워크가 아니에요.** 핸들러는 동기 Python 함수예요. 필요할 때의 동시성은 SQS 워커 내부의 `ThreadPoolExecutor` 또는 Lambda 자체의 스케일링에서 와요.
+
+## 비교
+
+| | sawsi | Chalice | Zappa | Serverless Framework |
+|---|---|---|---|---|
+| 라우팅 | `cmd` JSON | path decorator | path decorator | path / event map |
+| 데이터 계층 | DynamoModel ORM | 없음 | 없음 | 없음 |
+| AWS 클라이언트 | `api.py` 싱글턴 + `LazyLoadedAPI` | 호출마다 | 호출마다 | 호출마다 |
+| 배포 | Docker → ECR → Lambda update | `chalice deploy` zip | `zappa deploy` zip | `sls deploy` zip/container |
+| 다중 트리거 함대 | 1급 (`awsi add -t ...`) | 프로젝트당 앱 1개 | 프로젝트당 앱 1개 | 가능 |
+| 의견 강도 | 높음 (컨벤션) | 중간 | 중간 | 낮음 |
+
+## 언제 쓰나
+
+다음 중 **세 가지 이상**이 참이면 sawsi를 고려해 보세요:
+
+- DynamoDB가 주 저장소이고 테이블이 두 개 이상이에요.
+- 람다가 두 개 이상 필요해요 (API Gateway + 워커, 또는 여러 트리거).
+- 같은 코드베이스에서 `dev`와 `prod`를 출시하며 엄격한 분리가 필요해요.
+- 앱이 건드리는 모든 AWS 리소스를 한 곳에서 보고 싶어요.
+- 새 엔드포인트가 라우팅 테이블 편집이 아니라 데코레이터 붙은 함수 하나로 떨어지길 원해요.
+
+## 언제 쓰지 말까
+
+- 한 함수짜리 유틸리티 람다를 만들고 있을 때예요. 보일러플레이트가 아까워요.
+- 데이터 계층이 Postgres 등 RDBMS일 때예요. DynamoModel 챕터가 안 맞고, 프레임워크 나머지는 `api.dynamo`가 있다고 가정해요.
+- 클라우드 이식성을 원할 때예요.
+- async/await가 주 동시성 모델이길 원할 때예요.
+
+## 다음에 읽을 것
+
+- 아직 sawsi 코드를 한 줄도 안 썼다면 → [시작하기](/docs/introduction/getting-started).
+- 골격 코드가 있고 모양을 이해하고 싶다면 → [멘탈 모델](/docs/introduction/mental-model).
+- 실제 프로젝트를 스캐폴딩하려면 → [`awsi` CLI](/docs/cli).
